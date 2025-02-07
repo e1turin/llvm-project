@@ -1,0 +1,57 @@
+On branch merge/rvv-exegesis-full
+Cherry-pick currently in progress.
+  (run "git cherry-pick --continue" to continue)
+  (use "git cherry-pick --skip" to skip this patch)
+  (use "git cherry-pick --abort" to cancel the cherry-pick operation)
+
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   llvm/lib/MC/MCSchedule.cpp
+	modified:   llvm/lib/Target/RISCV/RISCVInsertWriteVXRM.cpp
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/deserialize-obj-file.yaml
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/eligible-inst.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/explicit-sew.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/filter.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/reduction.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/self-aliasing.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/skip-rm.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew-zvk.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/vlmax-only.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/vtype-rm-setup.test
+	new file:   llvm/test/tools/llvm-exegesis/RISCV/serialize-obj-file.test
+	modified:   llvm/test/tools/llvm-exegesis/X86/analysis-noise.test
+	modified:   llvm/tools/llvm-exegesis/lib/Analysis.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/Analysis.h
+	new file:   llvm/tools/llvm-exegesis/lib/AnalysisPrinters.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkResult.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkResult.h
+	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkRunner.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkRunner.h
+	modified:   llvm/tools/llvm-exegesis/lib/CMakeLists.txt
+	modified:   llvm/tools/llvm-exegesis/lib/Clustering.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/Clustering.h
+	modified:   llvm/tools/llvm-exegesis/lib/LlvmState.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/MCInstrDescView.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/MCInstrDescView.h
+	modified:   llvm/tools/llvm-exegesis/lib/PerfHelper.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/ProgressMeter.h
+	modified:   llvm/tools/llvm-exegesis/lib/RISCV/CMakeLists.txt
+	new file:   llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPasses.h
+	new file:   llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPostprocessing.cpp
+	new file:   llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPreprocessing.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/RISCV/Target.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/SchedClassResolution.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/SchedClassResolution.h
+	modified:   llvm/tools/llvm-exegesis/lib/SerialSnippetGenerator.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/SnippetGenerator.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/Target.cpp
+	modified:   llvm/tools/llvm-exegesis/lib/Target.h
+	new file:   llvm/tools/llvm-exegesis/lib/Timer.cpp
+	new file:   llvm/tools/llvm-exegesis/lib/Timer.h
+	modified:   llvm/tools/llvm-exegesis/llvm-exegesis.cpp
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	status_merge.txt
+
