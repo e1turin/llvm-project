@@ -149,6 +149,8 @@ static std::vector<MCInst> loadFP64RegBits32(const MCSubtargetInfo &STI,
       MCInstBuilder(RISCV::FCVT_D_W).addReg(Reg).addReg(ScratchIntReg));
   return Instrs;
 }
+=======
+>>>>>>>
 
 static MCInst nop() {
   // ADDI X0, X0, 0
@@ -771,13 +773,8 @@ public:
 
   bool matchesArch(Triple::ArchType Arch) const override;
 
-<<<<<<<
   std::vector<MCInst> setRegTo(const MCSubtargetInfo &STI, MCRegister Reg,
                                const APInt &Value) const override;
-=======
-  std::vector<MCInst> setRegTo(const MCSubtargetInfo &STI, unsigned Reg,
-                               const APInt &Value) const override;
->>>>>>>
 
   MCRegister getDefaultLoopCounterRegister(const Triple &) const override;
 
@@ -894,7 +891,6 @@ bool ExegesisRISCVTarget::matchesArch(Triple::ArchType Arch) const {
   return Arch == Triple::riscv32 || Arch == Triple::riscv64;
 }
 
-<<<<<<<
 std::vector<MCInst> ExegesisRISCVTarget::setRegTo(const MCSubtargetInfo &STI,
                                                   MCRegister Reg,
                                                   const APInt &Value) const {
@@ -902,13 +898,36 @@ std::vector<MCInst> ExegesisRISCVTarget::setRegTo(const MCSubtargetInfo &STI,
     return loadIntReg(STI, Reg, Value);
   if (RISCV::FPR16RegClass.contains(Reg))
     return loadFPRegBits(STI, Reg, Value, RISCV::FMV_H_X);
+<<<<<<<
   if (RISCV::FPR32RegClass.contains(Reg))
     return loadFPRegBits(STI, Reg, Value, RISCV::FMV_W_X);
+=======
+  if (RISCV::FPR32RegClass.contains(Reg) &&
+      STI.hasFeature(RISCV::FeatureStdExtF))
+    return loadFPImmediate(32, STI, Reg, Value);
+>>>>>>>
+<<<<<<<
   if (RISCV::FPR64RegClass.contains(Reg)) {
     if (STI.hasFeature(RISCV::Feature64Bit))
       return loadFPRegBits(STI, Reg, Value, RISCV::FMV_D_X);
     return loadFP64RegBits32(STI, Reg, Value);
   }
+=======
+  if (RISCV::FPR64RegClass.contains(Reg) &&
+      STI.hasFeature(RISCV::FeatureStdExtD))
+    return loadFPImmediate(64, STI, Reg, Value);
+>>>>>>>
+  // MERGEME: does this check really required?
+  if (Reg == RISCV::X0) {
+    if (Value == 0U)
+      return {nop()};
+    errs() << "Cannot write non-zero values to X0\n";
+    return {};
+  }
+  if (RISCV::GPRNoX0RegClass.contains(Reg))
+    return loadIntImmediate(STI, Reg, Value);
+  // MERGEME: remove redundant case already presented upper.
+  //          should we skip VectorRegList?
   if (Reg == RISCV::FRM || Reg == RISCV::VL || Reg == RISCV::VLENB ||
       Reg == RISCV::VTYPE || RISCV::GPRPairRegClass.contains(Reg) ||
       RISCV::VRRegClass.contains(Reg) || isVectorRegList(Reg)) {
@@ -925,34 +944,7 @@ std::vector<MCInst> ExegesisRISCVTarget::setRegTo(const MCSubtargetInfo &STI,
          << ", results will be unreliable\n";
   return {};
 }
-=======
-std::vector<MCInst> ExegesisRISCVTarget::setRegTo(const MCSubtargetInfo &STI, 
-                                                  unsigned Reg,
-                                                  const APInt &Value) const {
-  if (Reg == RISCV::X0) {
-    if (Value == 0U)
-      // NOP
-      return {MCInstBuilder(RISCV::ADDI)
-                  .addReg(RISCV::X0)
-                  .addReg(RISCV::X0)
-                  .addImm(0U)};
-    errs() << "Cannot write non-zero values to X0\n";
-    return {};
-  }
 
-  if (RISCV::GPRNoX0RegClass.contains(Reg))
-    return loadIntImmediate(STI, Reg, Value);
-  if (RISCV::FPR32RegClass.contains(Reg) &&
-      STI.hasFeature(RISCV::FeatureStdExtF))
-    return loadFPImmediate(32, STI, Reg, Value);
-  if (RISCV::FPR64RegClass.contains(Reg) &&
-      STI.hasFeature(RISCV::FeatureStdExtD))
-    return loadFPImmediate(64, STI, Reg, Value);
-  return {};
-}
->>>>>>>
-
-<<<<<<<
 const MCPhysReg DefaultLoopCounterReg = RISCV::X31; // t6
 const MCPhysReg ScratchMemoryReg = RISCV::X10;      // a0
 
@@ -960,12 +952,6 @@ MCRegister
 ExegesisRISCVTarget::getDefaultLoopCounterRegister(const Triple &) const {
   return DefaultLoopCounterReg;
 }
-=======
-unsigned
-ExegesisRISCVTarget::getDefaultLoopCounterRegister(const Triple &TT) const {
-  return RISCV::X5;
-}
->>>>>>>
 
 <<<<<<<
 void ExegesisRISCVTarget::decrementLoopCounterAndJump(
