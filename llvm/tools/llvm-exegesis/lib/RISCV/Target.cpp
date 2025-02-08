@@ -150,6 +150,87 @@ static std::vector<MCInst> loadFP64RegBits32(const MCSubtargetInfo &STI,
   return Instrs;
 }
 =======
+static std::vector<MCInst> loadIntImmediate(const MCSubtargetInfo &STI,
+                                            unsigned Reg,
+                                            const APInt &Value) {
+  // Lower to materialization sequence.
+  RISCVMatInt::InstSeq Seq =
+      RISCVMatInt::generateInstSeq(Value.getSExtValue(), STI);
+  assert(!Seq.empty());
+
+  Register DstReg = Reg;
+  Register SrcReg = RISCV::X0;
+
+  std::vector<MCInst> Insts;
+  for (const RISCVMatInt::Inst &Inst : Seq) {
+    switch (Inst.getOpndKind()) {
+    case RISCVMatInt::Imm:
+      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
+                              .addReg(DstReg)
+                              .addImm(Inst.getImm()));
+      break;
+    case RISCVMatInt::RegX0:
+      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
+                              .addReg(DstReg)
+                              .addReg(SrcReg)
+                              .addReg(RISCV::X0));
+      break;
+    case RISCVMatInt::RegReg:
+      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
+                              .addReg(DstReg)
+                              .addReg(SrcReg)
+                              .addReg(SrcReg));
+      break;
+    case RISCVMatInt::RegImm:
+      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
+                              .addReg(DstReg)
+                              .addReg(SrcReg)
+                              .addImm(Inst.getImm()));
+      break;
+    }
+
+    // Only the first instruction has X0 as its source.
+    SrcReg = DstReg;
+  }
+  return Insts;
+}
+
+// Note that we assume the given APInt is an integer rather than a bit-casted
+// floating point value.
+static std::vector<MCInst> loadFPImmediate(unsigned FLen,
+                                            const MCSubtargetInfo &STI,
+                                            unsigned Reg, const APInt &Value) {
+  // Try FLI from the Zfa extension.
+  if (STI.hasFeature(RISCV::FeatureStdExtZfa)) {
+    APFloat FloatVal(FLen == 32 ? APFloat::IEEEsingle()
+                                : APFloat::IEEEdouble());
+    if (FloatVal.convertFromAPInt(Value, /*IsSigned=*/Value.isSignBitSet(),
+                                  APFloat::rmNearestTiesToEven) ==
+        APFloat::opOK) {
+      int Idx = RISCVLoadFPImm::getLoadFPImm(FloatVal);
+      if (Idx >= 0)
+        return {MCInstBuilder(FLen == 32 ? RISCV::FLI_S : RISCV::FLI_D)
+                    .addReg(Reg)
+                    .addImm(static_cast<uint64_t>(Idx))};
+    }
+  }
+
+  // Otherwise, move the value to a GPR (t0) first.
+  assert(Reg != RISCV::X5);
+  auto ImmSeq = loadIntImmediate(STI, RISCV::X5, Value);
+
+  // Then, use FCVT.
+  unsigned Opcode;
+  if (FLen == 32)
+    Opcode = Value.getBitWidth() <= 32 ? RISCV::FCVT_S_W : RISCV::FCVT_S_L;
+  else
+    Opcode = Value.getBitWidth() <= 32 ? RISCV::FCVT_D_W : RISCV::FCVT_D_L;
+  ImmSeq.emplace_back(
+      MCInstBuilder(Opcode).addReg(Reg).addReg(RISCV::X5).addImm(
+          RISCVFPRndMode::RNE));
+
+  return ImmSeq;
+}
 >>>>>>>
 
 static MCInst nop() {
@@ -160,6 +241,7 @@ static MCInst nop() {
       .addImm(0);
 }
 
+<<<<<<<
 static bool isVectorRegList(MCRegister Reg) {
   return RISCV::VRM2RegClass.contains(Reg) ||
          RISCV::VRM4RegClass.contains(Reg) ||
@@ -778,7 +860,6 @@ public:
 
   MCRegister getDefaultLoopCounterRegister(const Triple &) const override;
 
-<<<<<<<
   MCRegister getScratchMemoryRegister(const Triple &TT) const override;
 
   void fillMemoryOperands(InstructionTemplate &IT, MCRegister Reg,
@@ -797,8 +878,6 @@ public:
   std::vector<InstructionTemplate>
   generateInstructionVariants(const Instruction &Instr,
                               unsigned MaxConfigsPerOpcode) const override;
-=======
->>>>>>>
 
 <<<<<<<
 =======
@@ -808,18 +887,7 @@ private:
   RegisterValue assignInitialRegisterValue(const Instruction &I,
                                            const Operand &Op,
                                            unsigned Reg) const override;
-
-  static std::vector<MCInst> loadIntImmediate(const MCSubtargetInfo &STI,
-                                              unsigned Reg,
-                                              const APInt &Value);
-
-  // Note that we assume the given APInt is an integer rather than a bit-casted
-  // floating point value.
-  static std::vector<MCInst> loadFPImmediate(unsigned FLen,
-                                             const MCSubtargetInfo &STI,
-                                             unsigned Reg, const APInt &Value);
-
->>>>>>> bcced4b0d15c ([Exegesis][RISCV] RVV support for llvm-exegesis)
+>>>>>>>
 
   void decrementLoopCounterAndJump(MachineBasicBlock &MBB,
                                    MachineBasicBlock &TargetMBB,
@@ -953,10 +1021,10 @@ ExegesisRISCVTarget::getDefaultLoopCounterRegister(const Triple &) const {
   return DefaultLoopCounterReg;
 }
 
-<<<<<<<
 void ExegesisRISCVTarget::decrementLoopCounterAndJump(
     MachineBasicBlock &MBB, MachineBasicBlock &TargetMBB,
     const MCInstrInfo &MII, MCRegister LoopRegister) const {
+<<<<<<<
   BuildMI(&MBB, DebugLoc(), MII.get(RISCV::ADDI))
       .addDef(LoopRegister)
       .addUse(LoopRegister)
@@ -965,11 +1033,7 @@ void ExegesisRISCVTarget::decrementLoopCounterAndJump(
       .addUse(LoopRegister)
       .addUse(RISCV::X0)
       .addMBB(&TargetMBB);
-}
 =======
-void ExegesisRISCVTarget::decrementLoopCounterAndJump(
-    MachineBasicBlock &MBB, MachineBasicBlock &TargetMBB,
-    const MCInstrInfo &MII, unsigned LoopRegister) const {
   MIMetadata MIMD;
   BuildMI(MBB, MBB.end(), MIMD, MII.get(RISCV::ADDI), LoopRegister)
       .addUse(LoopRegister)
@@ -978,8 +1042,8 @@ void ExegesisRISCVTarget::decrementLoopCounterAndJump(
       .addUse(LoopRegister)
       .addUse(RISCV::X0)
       .addMBB(&TargetMBB);
-}
 >>>>>>> bcced4b0d15c ([Exegesis][RISCV] RVV support for llvm-exegesis)
+}
 
 <<<<<<<
 MCRegister
@@ -1106,91 +1170,6 @@ bool ExegesisRISCVTarget::isOpcodeSupported(const MCInstrDesc &Desc) const {
   return ExegesisTarget::isOpcodeSupported(Desc);
 }
 
-
-std::vector<MCInst> 
-ExegesisRISCVTarget::loadIntImmediate(const MCSubtargetInfo &STI,
-                                      unsigned Reg,
-                                      const APInt &Value) {
-  // Lower to materialization sequence.
-  RISCVMatInt::InstSeq Seq =
-      RISCVMatInt::generateInstSeq(Value.getSExtValue(), STI);
-  assert(!Seq.empty());
-
-  Register DstReg = Reg;
-  Register SrcReg = RISCV::X0;
-
-  std::vector<MCInst> Insts;
-  for (const RISCVMatInt::Inst &Inst : Seq) {
-    switch (Inst.getOpndKind()) {
-    case RISCVMatInt::Imm:
-      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
-                              .addReg(DstReg)
-                              .addImm(Inst.getImm()));
-      break;
-    case RISCVMatInt::RegX0:
-      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
-                              .addReg(DstReg)
-                              .addReg(SrcReg)
-                              .addReg(RISCV::X0));
-      break;
-    case RISCVMatInt::RegReg:
-      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
-                              .addReg(DstReg)
-                              .addReg(SrcReg)
-                              .addReg(SrcReg));
-      break;
-    case RISCVMatInt::RegImm:
-      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
-                              .addReg(DstReg)
-                              .addReg(SrcReg)
-                              .addImm(Inst.getImm()));
-      break;
-    }
-
-    // Only the first instruction has X0 as its source.
-    SrcReg = DstReg;
-  }
-  return Insts;
-}
-
-
-std::vector<MCInst>
-ExegesisRISCVTarget::loadFPImmediate(unsigned FLen,
-                                     const MCSubtargetInfo &STI,
-                                     unsigned Reg, const APInt &Value) {
-  // Try FLI from the Zfa extension.
-  if (STI.hasFeature(RISCV::FeatureStdExtZfa)) {
-    APFloat FloatVal(FLen == 32 ? APFloat::IEEEsingle()
-                                : APFloat::IEEEdouble());
-    if (FloatVal.convertFromAPInt(Value, /*IsSigned=*/Value.isSignBitSet(),
-                                  APFloat::rmNearestTiesToEven) ==
-        APFloat::opOK) {
-      int Idx = RISCVLoadFPImm::getLoadFPImm(FloatVal);
-      if (Idx >= 0)
-        return {MCInstBuilder(FLen == 32 ? RISCV::FLI_S : RISCV::FLI_D)
-                    .addReg(Reg)
-                    .addImm(static_cast<uint64_t>(Idx))};
-    }
-  }
-
-  // Otherwise, move the value to a GPR (t0) first.
-  assert(Reg != RISCV::X5);
-  auto ImmSeq = loadIntImmediate(STI, RISCV::X5, Value);
-
-  // Then, use FCVT.
-  unsigned Opcode;
-  if (FLen == 32)
-    Opcode = Value.getBitWidth() <= 32 ? RISCV::FCVT_S_W : RISCV::FCVT_S_L;
-  else
-    Opcode = Value.getBitWidth() <= 32 ? RISCV::FCVT_D_W : RISCV::FCVT_D_L;
-  ImmSeq.emplace_back(
-      MCInstBuilder(Opcode).addReg(Reg).addReg(RISCV::X5).addImm(
-          RISCVFPRndMode::RNE));
-
-  return ImmSeq;
-}
-
-
 RegisterValue
 ExegesisRISCVTarget::assignInitialRegisterValue(const Instruction &I,
                                                 const Operand &Op,
@@ -1229,7 +1208,6 @@ ExegesisRISCVTarget::assignInitialRegisterValue(const Instruction &I,
     return ExegesisTarget::assignInitialRegisterValue(I, Op, Reg);
   }
 }
-
 >>>>>>>
 
 } // anonymous namespace
