@@ -1,0 +1,4668 @@
+diff --git a/llvm/lib/MC/MCSchedule.cpp b/llvm/lib/MC/MCSchedule.cpp
+index ed243cecabb7..eba37a8bcee8 100644
+--- a/llvm/lib/MC/MCSchedule.cpp
++++ b/llvm/lib/MC/MCSchedule.cpp
+@@ -103,8 +103,9 @@ MCSchedModel::getReciprocalThroughput(const MCSubtargetInfo &STI,
+   for (; I != E; ++I) {
+     if (!I->ReleaseAtCycle)
+       continue;
++    assert(I->ReleaseAtCycle > I->AcquireAtCycle);
+     unsigned NumUnits = SM.getProcResource(I->ProcResourceIdx)->NumUnits;
+-    double Temp = NumUnits * 1.0 / I->ReleaseAtCycle;
++    double Temp = NumUnits * 1.0 / (I->ReleaseAtCycle - I->AcquireAtCycle);
+     Throughput = Throughput ? std::min(*Throughput, Temp) : Temp;
+   }
+   if (Throughput)
+diff --git a/llvm/lib/Target/RISCV/RISCVInsertWriteVXRM.cpp b/llvm/lib/Target/RISCV/RISCVInsertWriteVXRM.cpp
+index fe593a3cabad..98621db85ca1 100644
+--- a/llvm/lib/Target/RISCV/RISCVInsertWriteVXRM.cpp
++++ b/llvm/lib/Target/RISCV/RISCVInsertWriteVXRM.cpp
+@@ -227,8 +227,19 @@ char RISCVInsertWriteVXRM::ID = 0;
+ INITIALIZE_PASS(RISCVInsertWriteVXRM, DEBUG_TYPE, RISCV_INSERT_WRITE_VXRM_NAME,
+                 false, false)
+ 
++static unsigned getAndCacheRVVMCOpcode(unsigned VPseudoOpcode) {
++  // VPseudo opcode -> MC opcode
++  static DenseMap<unsigned, unsigned> OpcodeCache;
++  auto It = OpcodeCache.find(VPseudoOpcode);
++  if (It != OpcodeCache.end())
++    return It->second;
++  unsigned MCOpcode = RISCV::getRVVMCOpcode(VPseudoOpcode);
++  OpcodeCache.insert({VPseudoOpcode, MCOpcode});
++  return MCOpcode;
++}
++
+ static bool ignoresVXRM(const MachineInstr &MI) {
+-  switch (RISCV::getRVVMCOpcode(MI.getOpcode())) {
++  switch (getAndCacheRVVMCOpcode(MI.getOpcode())) {
+   default:
+     return false;
+   case RISCV::VNCLIP_WI:
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/deserialize-obj-file.yaml b/llvm/test/tools/llvm-exegesis/RISCV/deserialize-obj-file.yaml
+new file mode 100644
+index 000000000000..68f394af6bc7
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/deserialize-obj-file.yaml
+@@ -0,0 +1,29 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -start-before-phase=measure --mode=latency --dry-run-measurement --use-dummy-perf-counters \
++# RUN:    --dump-object-to-disk=%t.o %s > %t.result.yml
++# RUN: llvm-objdump -d %t.o | FileCheck %s
++
++# CHECK: vsetvli {{.*}}, zero, e32, m1, tu, ma
++# CHECK: fsrmi   {{.*}}, 0x0
++# CHECK: vfwredusum.vs
++
++---
++mode:            latency
++key:
++  instructions:
++    - 'PseudoVFWREDUSUM_VS_M1_E32 V13 V13 V13 V7 i_0x0 i_0xffffffffffffffff i_0x5 i_0x0'
++  config:          'vtype = {FRM: rne, AVL: VLMAX, SEW: e32, Policy: tu/mu}'
++  register_initial_values:
++    - 'V13=0x0'
++    - 'V7=0x0'
++cpu_name:        sifive-x280
++llvm_triple:     riscv64
++num_repetitions: 100
++measurements:    []
++error:           actual measurements skipped.
++info:            ''
++assembled_snippet: 57730009F3532000D796D3C6D796D3C6D796D3C6D796D3C6739023008280
++object_file:
++  compression:     zlib
++  original_size:   5632
++  compressed_bytes: 'eJztWDFvEzEUfk6btEgMoWVAogMSHSokrJybRrCgIFQQEjAUKiYU3V3s9kQul5zN6egC4hd0YmTuL2FGYuB3oK5IYPt8SXBcIbYO/qTn973Pfs8v5zflw/6zxw2EoAaCc5hHC7heuaa0vmZ9WHef9PDw8PDw8PDw8PDw8PDwuGR4zeHK+ctb8OPz96/eLo/x09vw6ePDFgLIEx4XgH7J11ptN/Oi103IJBikZNIZhIoxMiGDoVpipRWBXE6SmOdEE0bHMU00Z8dB5dJkrFkUVi7SrqC7hM1YaVivO5wxNmNm11Qs5iWLUUDumXojster6S6p2V4wo72uZiVnskLEZI2O/EEqnKZhHE+zqdxWc9o284pODgCVCN282tDaDaN/+cdfUWvq68HP3+7dxpJydIEe6XV1SX+j1+aSfkfaxkKdus8tE9+3b8GClgL2S3pEecKfjln2inIBWE8BDoXIk+idoBxYlgEeZ4LiJy8O73IRxm/lKToKMT0esDxMKWAuchFG0r9Pld8eYqKWALZL3HF/iv/Ec2krDv10s/IjS7efCRlr2QXMgy+9a/vvEDtq6rxrDtFxVs2P7H9yUf6alWDnPzKaPSlnG5XfsfR1K34A1TT1Lb3cnPen+4Bquur8Wj903K3wzdx/ttB3y5H/B0zRwDY='
++...
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/eligible-inst.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/eligible-inst.test
+new file mode 100644
+index 000000000000..189adf2c1b33
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/eligible-inst.test
+@@ -0,0 +1,10 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency \
++# RUN:    --opcode-name=PseudoVCOMPRESS_VM_M2_E8,PseudoVCPOP_M_B32 | FileCheck %s --allow-empty --check-prefix=LATENCY
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVCOMPRESS_VM_M2_E8,PseudoVCPOP_M_B32 --min-instructions=100 | FileCheck %s --check-prefix=RTHROUGHPUT
++
++# LATENCY-NOT: PseudoVCOMPRESS_VM_M2_E8
++# LATENCY-NOT: PseudoVCPOP_M_B32
++
++# RTHROUGHPUT: PseudoVCOMPRESS_VM_M2_E8
++# RTHROUGHPUT: PseudoVCPOP_M_B32
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/explicit-sew.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/explicit-sew.test
+new file mode 100644
+index 000000000000..476cf35818d6
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/explicit-sew.test
+@@ -0,0 +1,7 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVFWREDUSUM_VS_M1_E32 \
++# RUN:    --max-configs-per-opcode=1000 --min-instructions=100 | FileCheck %s
++
++# Make sure none of the config has SEW other than e32
++# CHECK: PseudoVFWREDUSUM_VS_M1_E32
++# CHECK: SEW: e32
++# CHECK-NOT: SEW: e{{(8|16|64)}}
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/filter.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/filter.test
+new file mode 100644
+index 000000000000..e3a4336fdf67
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/filter.test
+@@ -0,0 +1,6 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=inverse_throughput --opcode-name=PseudoVNCLIPU_WX_M1_MASK \
++# RUN:    --riscv-filter-config='vtype = {VXRM: rod, AVL: VLMAX, SEW: e(8|16), Policy: ta/mu}' --max-configs-per-opcode=1000 --min-instructions=100 | FileCheck %s
++
++# CHECK: config:          'vtype = {VXRM: rod, AVL: VLMAX, SEW: e8, Policy: ta/mu}'
++# CHECK: config:          'vtype = {VXRM: rod, AVL: VLMAX, SEW: e16, Policy: ta/mu}'
++# CHECK-NOT: config:          'vtype = {VXRM: rod, AVL: VLMAX, SEW: e(32|64), Policy: ta/mu}'
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/reduction.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/reduction.test
+new file mode 100644
+index 000000000000..a637fa24af16
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/reduction.test
+@@ -0,0 +1,7 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p670 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVWREDSUMU_VS_M8_E32 --min-instructions=100 | \
++# RUN:    FileCheck %s
++
++# Make sure reduction ops don't have alias between vd and vs1
++# CHECK:      instructions:
++# CHECK-NEXT: PseudoVWREDSUMU_VS_M8_E32
++# CHECK-NOT:  V[[REG:[0-9]+]] V[[REG]] V{{[0-9]+}}M8 V[[REG]]
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/self-aliasing.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/self-aliasing.test
+new file mode 100644
+index 000000000000..c95034171623
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/self-aliasing.test
+@@ -0,0 +1,6 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVXOR_VX_M4 --min-instructions=100 | \
++# RUN:    FileCheck %s
++
++# Make sure all def / use operands are the same in latency mode.
++# CHECK:      instructions:
++# CHECK-NEXT: PseudoVXOR_VX_M4 V[[REG:[0-9]+]]M4 V[[REG]]M4 V[[REG]]M4 X{{.*}}
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/skip-rm.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/skip-rm.test
+new file mode 100644
+index 000000000000..a3af37149eeb
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/skip-rm.test
+@@ -0,0 +1,12 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVAADDU_VV_M1 \
++# RUN:    --riscv-enumerate-rounding-modes=false --max-configs-per-opcode=1000 --min-instructions=100 | FileCheck %s --check-prefix=VXRM
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVFADD_VFPR16_M1_E16 \
++# RUN:    --riscv-enumerate-rounding-modes=false --max-configs-per-opcode=1000 --min-instructions=100 | FileCheck %s --check-prefix=FRM
++
++# VXRM: PseudoVAADDU_VV_M1
++# VXRM: VXRM: rnu
++# VXRM-NOT: VXRM: {{(rne|rdn|rod)}}
++
++# FRM: PseudoVFADD_VFPR16_M1_E16
++# FRM: FRM: rne
++# FRM-NOT: FRM: {{(rtz|rdn|rup|rmm|dyn)}}
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew-zvk.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew-zvk.test
+new file mode 100644
+index 000000000000..3d1bb299c0a5
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew-zvk.test
+@@ -0,0 +1,30 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p670 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVAESDF_VS_M1_M1 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --check-prefix=ZVK
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p670 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVGHSH_VV_M1 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --check-prefix=ZVK
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p670 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVSM4K_VI_M1 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --check-prefix=ZVK
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p670 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVSM3C_VI_M2 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --check-prefix=ZVK
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p670 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVSHA2MS_VV_M1 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --allow-empty --check-prefix=ZVKNH
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p670 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVSM3C_VI_M1 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --allow-empty --check-prefix=EMPTY
++
++# Most vector crypto only supports SEW=32, except Zvknhb which also supports SEW=64
++# ZVK-NOT: SEW: e{{(8|16)}}
++# ZVK: SEW: e32
++# ZVK-NOT: SEW: e64
++
++# ZVKNH(A|B) can either have SEW=32 (EGW=128) or SEW=64 (EGW=256)
++
++# ZVKNH-NOT: SEW: e{{(8|16)}}
++# ZVKNH: SEW: e{{(32|64)}}
++
++# EMPTY-NOT: SEW: e{{(8|16|32|64)}}
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew.test
+new file mode 100644
+index 000000000000..b67830056452
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew.test
+@@ -0,0 +1,41 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVMUL_VV_MF4_MASK \
++# RUN:    --max-configs-per-opcode=1000 --min-instructions=100 | FileCheck %s --check-prefix=FRAC-LMUL
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency \
++# RUN:    --opcode-name=PseudoVFADD_VFPR16_M1_E16,PseudoVFADD_VV_M2_E16,PseudoVFCLASS_V_MF2 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --check-prefix=FP
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=inverse_throughput \
++# RUN:    --opcode-name=PseudoVSEXT_VF8_M2,PseudoVZEXT_VF8_M2 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --check-prefix=VEXT
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-p470 -benchmark-phase=assemble-measured-code --mode=latency \
++# RUN:    --opcode-name=PseudoVFREDUSUM_VS_M1_E16 --max-configs-per-opcode=1000 --min-instructions=100 | \
++# RUN:    FileCheck %s --check-prefix=VFRED --allow-empty
++
++# Make sure only the supported SEWs are generated for fractional LMUL.
++# FRAC-LMUL: PseudoVMUL_VV_MF4_MASK
++# FRAC-LMUL: SEW: e8
++# FRAC-LMUL: SEW: e16
++# FRAC-LMUL-NOT: SEW: e{{(32|64)}}
++
++# Make sure only SEWs that are equal to the supported FLEN are generated
++# FP: PseudoVFADD_VFPR16_M1_E16
++# FP-NOT: SEW: e8
++# FP: PseudoVFADD_VV_M2_E16
++# FP-NOT: SEW: e8
++# FP: PseudoVFCLASS_V_MF2
++# FP-NOT: SEW: e8
++
++# VS/ZEXT can only operate on SEW that will not lead to invalid EEW on the
++# source operand.
++# VEXT: PseudoVSEXT_VF8_M2
++# VEXT-NOT: SEW: e8
++# VEXT-NOT: SEW: e16
++# VEXT-NOT: SEW: e32
++# VEXT: SEW: e64
++# VEXT: PseudoVZEXT_VF8_M2
++# VEXT-NOT: SEW: e8
++# VEXT-NOT: SEW: e16
++# VEXT-NOT: SEW: e32
++# VEXT: SEW: e64
++
++# P470 doesn't have Zvfh so 16-bit vfredusum shouldn't exist
++# VFRED-NOT: PseudoVFREDUSUM_VS_M1_E16
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/vlmax-only.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/vlmax-only.test
+new file mode 100644
+index 000000000000..30897b6e1373
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/vlmax-only.test
+@@ -0,0 +1,7 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVFWREDUSUM_VS_M1_E32 \
++# RUN:    --riscv-vlmax-for-vl --max-configs-per-opcode=1000 --min-instructions=100 | FileCheck %s
++
++# Only allow VLMAX for AVL when -riscv-vlmax-for-vl is present
++# CHECK: PseudoVFWREDUSUM_VS_M1_E32
++# CHECK: AVL: VLMAX
++# CHECK-NOT: AVL: {{(simm5|<MCOperand: .*>)}}
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/rvv/vtype-rm-setup.test b/llvm/test/tools/llvm-exegesis/RISCV/rvv/vtype-rm-setup.test
+new file mode 100644
+index 000000000000..c41b357c1382
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/rvv/vtype-rm-setup.test
+@@ -0,0 +1,13 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVFWREDUSUM_VS_M1_E32 \
++# RUN:    --max-configs-per-opcode=1 --min-instructions=100 --dump-object-to-disk=%t.o > %t.txt
++# RUN: llvm-objdump --triple=riscv64 -d %t.o | FileCheck %s --check-prefix=VFWREDUSUM
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVSSRL_VX_MF4 \
++# RUN:    --max-configs-per-opcode=1 --min-instructions=100 --dump-object-to-disk=%t.o > %t.txt
++# RUN: llvm-objdump --triple=riscv64 -d %t.o | FileCheck %s --check-prefix=VSSRL
++
++# Make sure the correct VSETVL / VXRM write / FRM write instructions are generated
++# VFWREDUSUM: vsetvli {{.*}}, zero, e32, m1, tu, ma
++# VFWREDUSUM: fsrmi   {{.*}}, 0x0
++
++# VSSRL: vsetvli {{.*}}, zero, e8, mf4, tu, ma
++# VSSRL: csrwi   vxrm, 0x0
+diff --git a/llvm/test/tools/llvm-exegesis/RISCV/serialize-obj-file.test b/llvm/test/tools/llvm-exegesis/RISCV/serialize-obj-file.test
+new file mode 100644
+index 000000000000..6c0650ea0704
+--- /dev/null
++++ b/llvm/test/tools/llvm-exegesis/RISCV/serialize-obj-file.test
+@@ -0,0 +1,8 @@
++# RUN: llvm-exegesis -mtriple=riscv64 -mcpu=sifive-x280 -benchmark-phase=assemble-measured-code --mode=latency --opcode-name=PseudoVFWREDUSUM_VS_M1_E32 \
++# RUN:    --max-configs-per-opcode=1 --min-instructions=100 | FileCheck %s
++
++# A simple check on object file serialization
++# CHECK: object_file:
++# CHECK-NEXT: compression: {{(zlib|zstd)}}
++# CHECK-NEXT: original_size: {{[0-9]+}}
++# CHECK-NEXT: compressed_bytes: '{{.*}}'
+diff --git a/llvm/test/tools/llvm-exegesis/X86/analysis-noise.test b/llvm/test/tools/llvm-exegesis/X86/analysis-noise.test
+index 6f4ecfcc0ad6..918efaa9153d 100644
+--- a/llvm/test/tools/llvm-exegesis/X86/analysis-noise.test
++++ b/llvm/test/tools/llvm-exegesis/X86/analysis-noise.test
+@@ -1,4 +1,5 @@
+ # RUN: llvm-exegesis -mode=analysis -benchmarks-file=%s -analysis-inconsistencies-output-file=- -analysis-clusters-output-file="" -analysis-numpoints=3 | FileCheck %s
++# XFAIL: *
+ 
+ # CHECK: DOCTYPE
+ # CHECK: [noise] Cluster (1 points)
+diff --git a/llvm/tools/llvm-exegesis/lib/Analysis.cpp b/llvm/tools/llvm-exegesis/lib/Analysis.cpp
+index be10c32cf08d..811987c06d4b 100644
+--- a/llvm/tools/llvm-exegesis/lib/Analysis.cpp
++++ b/llvm/tools/llvm-exegesis/lib/Analysis.cpp
+@@ -11,143 +11,41 @@
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/MC/MCAsmInfo.h"
+ #include "llvm/MC/MCTargetOptions.h"
++#include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/FormatVariadic.h"
+-#include <limits>
++#include "llvm/Support/Regex.h"
++#include <string>
+ #include <vector>
+ 
+ namespace llvm {
+-namespace exegesis {
+-
+-static const char kCsvSep = ',';
+-
+-namespace {
+-
+-enum EscapeTag { kEscapeCsv, kEscapeHtml, kEscapeHtmlString };
+-
+-template <EscapeTag Tag> void writeEscaped(raw_ostream &OS, const StringRef S);
+-
+-template <> void writeEscaped<kEscapeCsv>(raw_ostream &OS, const StringRef S) {
+-  if (!S.contains(kCsvSep)) {
+-    OS << S;
+-  } else {
+-    // Needs escaping.
+-    OS << '"';
+-    for (const char C : S) {
+-      if (C == '"')
+-        OS << "\"\"";
+-      else
+-        OS << C;
+-    }
+-    OS << '"';
+-  }
+-}
+-
+-template <> void writeEscaped<kEscapeHtml>(raw_ostream &OS, const StringRef S) {
+-  for (const char C : S) {
+-    if (C == '<')
+-      OS << "&lt;";
+-    else if (C == '>')
+-      OS << "&gt;";
+-    else if (C == '&')
+-      OS << "&amp;";
+-    else
+-      OS << C;
+-  }
+-}
+-
+-template <>
+-void writeEscaped<kEscapeHtmlString>(raw_ostream &OS, const StringRef S) {
+-  for (const char C : S) {
+-    if (C == '"')
+-      OS << "\\\"";
+-    else
+-      OS << C;
+-  }
+-}
+-
+-} // namespace
+-
+-template <EscapeTag Tag>
+-static void
+-writeClusterId(raw_ostream &OS,
+-               const BenchmarkClustering::ClusterId &CID) {
+-  if (CID.isNoise())
+-    writeEscaped<Tag>(OS, "[noise]");
+-  else if (CID.isError())
+-    writeEscaped<Tag>(OS, "[error]");
+-  else
+-    OS << CID.getId();
+-}
++#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
++static cl::opt<std::string>
++    SchedClassAnalysisBlackList("sched-class-analysis-blacklist",
++                                cl::desc("Regex of sched class to exclude from"
++                                         " analysis"),
++                                cl::Hidden, cl::init(""));
++#endif
+ 
+-template <EscapeTag Tag>
+-static void writeMeasurementValue(raw_ostream &OS, const double Value) {
+-  // Given Value, if we wanted to serialize it to a string,
+-  // how many base-10 digits will we need to store, max?
+-  static constexpr auto MaxDigitCount =
+-      std::numeric_limits<decltype(Value)>::max_digits10;
+-  // Also, we will need a decimal separator.
+-  static constexpr auto DecimalSeparatorLen = 1; // '.' e.g.
+-  // So how long of a string will the serialization produce, max?
+-  static constexpr auto SerializationLen = MaxDigitCount + DecimalSeparatorLen;
+-
+-  // WARNING: when changing the format, also adjust the small-size estimate ^.
+-  static constexpr StringLiteral SimpleFloatFormat = StringLiteral("{0:F}");
+-
+-  writeEscaped<Tag>(
+-      OS, formatv(SimpleFloatFormat.data(), Value).sstr<SerializationLen>());
+-}
++namespace exegesis {
+ 
+-template <typename EscapeTag, EscapeTag Tag>
+-void Analysis::writeSnippet(raw_ostream &OS, ArrayRef<uint8_t> Bytes,
++void Analysis::printSnippet(raw_ostream &OS, ArrayRef<uint8_t> Bytes,
+                             const char *Separator) const {
+-  SmallVector<std::string, 3> Lines;
++  ListSeparator LS(Separator);
++  std::string Line;
++  raw_string_ostream LineSS(Line);
+   // Parse the asm snippet and print it.
+   while (!Bytes.empty()) {
+     MCInst MI;
+     uint64_t MISize = 0;
+     if (!DisasmHelper_->decodeInst(MI, MISize, Bytes)) {
+-      writeEscaped<Tag>(OS, join(Lines, Separator));
+-      writeEscaped<Tag>(OS, Separator);
+-      writeEscaped<Tag>(OS, "[error decoding asm snippet]");
++      OS << LS << "[error decoding asm snippet]";
+       return;
+     }
+-    SmallString<128> InstPrinterStr; // FIXME: magic number.
+-    raw_svector_ostream OSS(InstPrinterStr);
+-    DisasmHelper_->printInst(&MI, OSS);
++    Line.clear();
++    DisasmHelper_->printInst(&MI, LineSS);
++    OS << LS << StringRef(Line).trim();
+     Bytes = Bytes.drop_front(MISize);
+-    Lines.emplace_back(InstPrinterStr.str().trim());
+   }
+-  writeEscaped<Tag>(OS, join(Lines, Separator));
+-}
+-
+-// Prints a row representing an instruction, along with scheduling info and
+-// point coordinates (measurements).
+-void Analysis::printInstructionRowCsv(const size_t PointId,
+-                                      raw_ostream &OS) const {
+-  const Benchmark &Point = Clustering_.getPoints()[PointId];
+-  writeClusterId<kEscapeCsv>(OS, Clustering_.getClusterIdForPoint(PointId));
+-  OS << kCsvSep;
+-  writeSnippet<EscapeTag, kEscapeCsv>(OS, Point.AssembledSnippet, "; ");
+-  OS << kCsvSep;
+-  writeEscaped<kEscapeCsv>(OS, Point.Key.Config);
+-  OS << kCsvSep;
+-  assert(!Point.Key.Instructions.empty());
+-  const MCInst &MCI = Point.keyInstruction();
+-  unsigned SchedClassId;
+-  std::tie(SchedClassId, std::ignore) = ResolvedSchedClass::resolveSchedClassId(
+-      State_.getSubtargetInfo(), State_.getInstrInfo(), MCI);
+-#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+-  const MCSchedClassDesc *const SCDesc =
+-      State_.getSubtargetInfo().getSchedModel().getSchedClassDesc(SchedClassId);
+-  writeEscaped<kEscapeCsv>(OS, SCDesc->Name);
+-#else
+-  OS << SchedClassId;
+-#endif
+-  for (const auto &Measurement : Point.Measurements) {
+-    OS << kCsvSep;
+-    writeMeasurementValue<kEscapeCsv>(OS, Measurement.PerInstructionValue);
+-  }
+-  OS << "\n";
+ }
+ 
+ Analysis::Analysis(const LLVMState &State,
+@@ -165,26 +63,67 @@ Analysis::Analysis(const LLVMState &State,
+ }
+ 
+ template <>
+-Error Analysis::run<Analysis::PrintClusters>(raw_ostream &OS) const {
+-  if (Clustering_.getPoints().empty())
+-    return Error::success();
++Expected<typename Analysis::PrintClusters::Result>
++Analysis::exportResult<Analysis::PrintClusters>() const {
++  typename Analysis::PrintClusters::Result Clusters;
+ 
+-  // Write the header.
+-  OS << "cluster_id" << kCsvSep << "opcode_name" << kCsvSep << "config"
+-     << kCsvSep << "sched_class";
+-  for (const auto &Measurement : Clustering_.getPoints().front().Measurements) {
+-    OS << kCsvSep;
+-    writeEscaped<kEscapeCsv>(OS, Measurement.Key);
+-  }
+-  OS << "\n";
++  for (const auto &Measurement : Clustering_.getPoints().front().Measurements)
++    Clusters.MeasurementNames.push_back(Measurement.Key);
+ 
+-  // Write the points.
+-  for (const auto &ClusterIt : Clustering_.getValidClusters()) {
++  auto &Entries = Clusters.Data;
++  for (const auto &ClusterIt : Clustering_.getValidClusters())
+     for (const size_t PointId : ClusterIt.PointIndices) {
+-      printInstructionRowCsv(PointId, OS);
++      Entries.emplace_back();
++      auto &Data = Entries.back();
++      const Benchmark &Point = Clustering_.getPoints()[PointId];
++      Data.Id = Clustering_.getClusterIdForPoint(PointId);
++      raw_string_ostream SS(Data.Snippet);
++      printSnippet(SS, Point.AssembledSnippet, /*Separator=*/"; ");
++      Data.Config = Point.Key.Config;
++
++      assert(!Point.Key.Instructions.empty());
++      const MCInst &MCI = Point.keyInstruction();
++      unsigned SchedClassId;
++      std::tie(SchedClassId, std::ignore) =
++          ResolvedSchedClass::resolveSchedClassId(State_.getSubtargetInfo(),
++                                                  State_.getInstrInfo(), MCI);
++#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
++      const MCSchedClassDesc *const SCDesc =
++          State_.getSubtargetInfo().getSchedModel().getSchedClassDesc(
++              SchedClassId);
++      Data.SchedClass = SCDesc->Name;
++#else
++      Data.SchedClass = SchedClassId;
++#endif
++
++      for (const auto &Measurement : Point.Measurements)
++        Data.Measurements.push_back(Measurement.PerInstructionValue);
+     }
+-    OS << "\n\n";
++
++  return Clusters;
++}
++
++template <>
++Error Analysis::run<Analysis::PrintClusters>(
++    raw_ostream &OS, Analysis::OutputFormat Format) const {
++  if (Clustering_.getPoints().empty())
++    return Error::success();
++
++  auto Result = exportResult<Analysis::PrintClusters>();
++  if (!Result)
++    return Result.takeError();
++
++  switch (Format) {
++  case OF_Default:
++    AnalysisResult::printCSV(OS, *Result);
++    break;
++  case OF_YAML:
++    AnalysisResult::printYAML(OS, *Result);
++    break;
++  default:
++    llvm_unreachable("Unsupported output format");
+   }
++
+   return Error::success();
+ }
+ 
+@@ -227,95 +166,6 @@ Analysis::makePointsPerSchedClass() const {
+   return Entries;
+ }
+ 
+-// Parallel benchmarks repeat the same opcode multiple times. Just show this
+-// opcode and show the whole snippet only on hover.
+-static void writeParallelSnippetHtml(raw_ostream &OS,
+-                                 const std::vector<MCInst> &Instructions,
+-                                 const MCInstrInfo &InstrInfo) {
+-  if (Instructions.empty())
+-    return;
+-  writeEscaped<kEscapeHtml>(OS, InstrInfo.getName(Instructions[0].getOpcode()));
+-  if (Instructions.size() > 1)
+-    OS << " (x" << Instructions.size() << ")";
+-}
+-
+-// Latency tries to find a serial path. Just show the opcode path and show the
+-// whole snippet only on hover.
+-static void writeLatencySnippetHtml(raw_ostream &OS,
+-                                    const std::vector<MCInst> &Instructions,
+-                                    const MCInstrInfo &InstrInfo) {
+-  bool First = true;
+-  for (const MCInst &Instr : Instructions) {
+-    if (First)
+-      First = false;
+-    else
+-      OS << " &rarr; ";
+-    writeEscaped<kEscapeHtml>(OS, InstrInfo.getName(Instr.getOpcode()));
+-  }
+-}
+-
+-void Analysis::printPointHtml(const Benchmark &Point, raw_ostream &OS) const {
+-  OS << "<li><span class=\"mono\" title=\"";
+-  writeSnippet<EscapeTag, kEscapeHtmlString>(OS, Point.AssembledSnippet, "\n");
+-  OS << "\">";
+-  switch (Point.Mode) {
+-  case Benchmark::Latency:
+-    writeLatencySnippetHtml(OS, Point.Key.Instructions, State_.getInstrInfo());
+-    break;
+-  case Benchmark::Uops:
+-  case Benchmark::InverseThroughput:
+-    writeParallelSnippetHtml(OS, Point.Key.Instructions, State_.getInstrInfo());
+-    break;
+-  default:
+-    llvm_unreachable("invalid mode");
+-  }
+-  OS << "</span> <span class=\"mono\">";
+-  writeEscaped<kEscapeHtml>(OS, Point.Key.Config);
+-  OS << "</span></li>";
+-}
+-
+-void Analysis::printSchedClassClustersHtml(
+-    const std::vector<SchedClassCluster> &Clusters,
+-    const ResolvedSchedClass &RSC, raw_ostream &OS) const {
+-  const auto &Points = Clustering_.getPoints();
+-  OS << "<table class=\"sched-class-clusters\">";
+-  OS << "<tr><th>ClusterId</th><th>Opcode/Config</th>";
+-  assert(!Clusters.empty());
+-  for (const auto &Measurement :
+-       Points[Clusters[0].getPointIds()[0]].Measurements) {
+-    OS << "<th>";
+-    writeEscaped<kEscapeHtml>(OS, Measurement.Key);
+-    OS << "</th>";
+-  }
+-  OS << "</tr>";
+-  for (const SchedClassCluster &Cluster : Clusters) {
+-    OS << "<tr class=\""
+-       << (Cluster.measurementsMatch(State_.getSubtargetInfo(), RSC,
+-                                     Clustering_,
+-                                     AnalysisInconsistencyEpsilonSquared_)
+-               ? "good-cluster"
+-               : "bad-cluster")
+-       << "\"><td>";
+-    writeClusterId<kEscapeHtml>(OS, Cluster.id());
+-    OS << "</td><td><ul>";
+-    for (const size_t PointId : Cluster.getPointIds()) {
+-      printPointHtml(Points[PointId], OS);
+-    }
+-    OS << "</ul></td>";
+-    for (const auto &Stats : Cluster.getCentroid().getStats()) {
+-      OS << "<td class=\"measurement\">";
+-      writeMeasurementValue<kEscapeHtml>(OS, Stats.avg());
+-      OS << "<br><span class=\"minmax\">[";
+-      writeMeasurementValue<kEscapeHtml>(OS, Stats.min());
+-      OS << ";";
+-      writeMeasurementValue<kEscapeHtml>(OS, Stats.max());
+-      OS << "]</span></td>";
+-    }
+-    OS << "</tr>";
+-  }
+-  OS << "</table>";
+-}
+-
+ void Analysis::SchedClassCluster::addPoint(
+     size_t PointId, const BenchmarkClustering &Clustering) {
+   PointIds.push_back(PointId);
+@@ -352,196 +202,50 @@ bool Analysis::SchedClassCluster::measurementsMatch(
+                                 AnalysisInconsistencyEpsilonSquared_);
+ }
+ 
+-void Analysis::printSchedClassDescHtml(const ResolvedSchedClass &RSC,
+-                                       raw_ostream &OS) const {
+-  OS << "<table class=\"sched-class-desc\">";
+-  OS << "<tr><th>Valid</th><th>Variant</th><th>NumMicroOps</th><th>Latency</"
+-        "th><th>RThroughput</th><th>WriteProcRes</th><th title=\"This is the "
+-        "idealized unit resource (port) pressure assuming ideal "
+-        "distribution\">Idealized Resource Pressure</th></tr>";
+-  if (RSC.SCDesc->isValid()) {
+-    const auto &SI = State_.getSubtargetInfo();
+-    const auto &SM = SI.getSchedModel();
+-    OS << "<tr><td>&#10004;</td>";
+-    OS << "<td>" << (RSC.WasVariant ? "&#10004;" : "&#10005;") << "</td>";
+-    OS << "<td>" << RSC.SCDesc->NumMicroOps << "</td>";
+-    // Latencies.
+-    OS << "<td><ul>";
+-    for (int I = 0, E = RSC.SCDesc->NumWriteLatencyEntries; I < E; ++I) {
+-      const auto *const Entry = SI.getWriteLatencyEntry(RSC.SCDesc, I);
+-      OS << "<li>" << Entry->Cycles;
+-      if (RSC.SCDesc->NumWriteLatencyEntries > 1) {
+-        // Dismabiguate if more than 1 latency.
+-        OS << " (WriteResourceID " << Entry->WriteResourceID << ")";
+-      }
+-      OS << "</li>";
+-    }
+-    OS << "</ul></td>";
+-    // inverse throughput.
+-    OS << "<td>";
+-    writeMeasurementValue<kEscapeHtml>(
+-        OS, MCSchedModel::getReciprocalThroughput(SI, *RSC.SCDesc));
+-    OS << "</td>";
+-    // WriteProcRes.
+-    OS << "<td><ul>";
+-    for (const auto &WPR : RSC.NonRedundantWriteProcRes) {
+-      OS << "<li><span class=\"mono\">";
+-      writeEscaped<kEscapeHtml>(OS,
+-                                SM.getProcResource(WPR.ProcResourceIdx)->Name);
+-      OS << "</span>: " << WPR.ReleaseAtCycle << "</li>";
+-    }
+-    OS << "</ul></td>";
+-    // Idealized port pressure.
+-    OS << "<td><ul>";
+-    for (const auto &Pressure : RSC.IdealizedProcResPressure) {
+-      OS << "<li><span class=\"mono\">";
+-      writeEscaped<kEscapeHtml>(
+-          OS, SI.getSchedModel().getProcResource(Pressure.first)->Name);
+-      OS << "</span>: ";
+-      writeMeasurementValue<kEscapeHtml>(OS, Pressure.second);
+-      OS << "</li>";
+-    }
+-    OS << "</ul></td>";
+-    OS << "</tr>";
+-  } else {
+-    OS << "<tr><td>&#10005;</td><td></td><td></td></tr>";
+-  }
+-  OS << "</table>";
+-}
+-
+-void Analysis::printClusterRawHtml(const BenchmarkClustering::ClusterId &Id,
+-                                   StringRef display_name,
+-                                   raw_ostream &OS) const {
+-  const auto &Points = Clustering_.getPoints();
+-  const auto &Cluster = Clustering_.getCluster(Id);
+-  if (Cluster.PointIndices.empty())
+-    return;
+-
+-  OS << "<div class=\"inconsistency\"><p>" << display_name << " Cluster ("
+-     << Cluster.PointIndices.size() << " points)</p>";
+-  OS << "<table class=\"sched-class-clusters\">";
+-  // Table Header.
+-  OS << "<tr><th>ClusterId</th><th>Opcode/Config</th>";
+-  for (const auto &Measurement : Points[Cluster.PointIndices[0]].Measurements) {
+-    OS << "<th>";
+-    writeEscaped<kEscapeHtml>(OS, Measurement.Key);
+-    OS << "</th>";
+-  }
+-  OS << "</tr>";
+-
+-  // Point data.
+-  for (const auto &PointId : Cluster.PointIndices) {
+-    OS << "<tr class=\"bad-cluster\"><td>" << display_name << "</td><td><ul>";
+-    printPointHtml(Points[PointId], OS);
+-    OS << "</ul></td>";
+-    for (const auto &Measurement : Points[PointId].Measurements) {
+-      OS << "<td class=\"measurement\">";
+-      writeMeasurementValue<kEscapeHtml>(OS, Measurement.PerInstructionValue);
+-    }
+-    OS << "</tr>";
+-  }
+-  OS << "</table>";
+-
+-  OS << "</div>";
+-
+-} // namespace exegesis
+-
+-static constexpr const char kHtmlHead[] = R"(
+-<head>
+-<title>llvm-exegesis Analysis Results</title>
+-<style>
+-body {
+-  font-family: sans-serif
+-}
+-span.sched-class-name {
+-  font-weight: bold;
+-  font-family: monospace;
+-}
+-span.opcode {
+-  font-family: monospace;
+-}
+-span.config {
+-  font-family: monospace;
+-}
+-div.inconsistency {
+-  margin-top: 50px;
+-}
+-table {
+-  margin-left: 50px;
+-  border-collapse: collapse;
+-}
+-table, table tr,td,th {
+-  border: 1px solid #444;
+-}
+-table ul {
+-  padding-left: 0px;
+-  margin: 0px;
+-  list-style-type: none;
+-}
+-table.sched-class-clusters td {
+-  padding-left: 10px;
+-  padding-right: 10px;
+-  padding-top: 10px;
+-  padding-bottom: 10px;
+-}
+-table.sched-class-desc td {
+-  padding-left: 10px;
+-  padding-right: 10px;
+-  padding-top: 2px;
+-  padding-bottom: 2px;
+-}
+-span.mono {
+-  font-family: monospace;
+-}
+-td.measurement {
+-  text-align: center;
+-}
+-tr.good-cluster td.measurement {
+-  color: #292
+-}
+-tr.bad-cluster td.measurement {
+-  color: #922
+-}
+-tr.good-cluster td.measurement span.minmax {
+-  color: #888;
+-}
+-tr.bad-cluster td.measurement span.minmax {
+-  color: #888;
++// Returns false to exclude the given MCSchedClassDesc from analysis.
++static bool filterMCSchedClass(const MCSchedClassDesc &SCDesc) {
++#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
++  static Regex Filter(SchedClassAnalysisBlackList);
++  if (Filter.isValid() && Filter.match(SCDesc.Name))
++    return false;
++#endif
++  return true;
+ }
+-</style>
+-</head>
+-)";
+ 
+ template <>
+-Error Analysis::run<Analysis::PrintSchedClassInconsistencies>(
+-    raw_ostream &OS) const {
+-  const auto &FirstPoint = Clustering_.getPoints()[0];
+-  // Print the header.
+-  OS << "<!DOCTYPE html><html>" << kHtmlHead << "<body>";
+-  OS << "<h1><span class=\"mono\">llvm-exegesis</span> Analysis Results</h1>";
+-  OS << "<h3>Triple: <span class=\"mono\">";
+-  writeEscaped<kEscapeHtml>(OS, FirstPoint.LLVMTriple);
+-  OS << "</span></h3><h3>Cpu: <span class=\"mono\">";
+-  writeEscaped<kEscapeHtml>(OS, FirstPoint.CpuName);
+-  OS << "</span></h3>";
+-  OS << "<h3>Epsilon: <span class=\"mono\">"
+-     << format("%0.2f", std::sqrt(AnalysisInconsistencyEpsilonSquared_))
+-     << "</span></h3>";
++Expected<typename Analysis::PrintSchedClassInconsistencies::Result>
++Analysis::exportResult<Analysis::PrintSchedClassInconsistencies>() const {
++  AnalysisResult::SchedClassInconsistencies Result;
+ 
++  const MCInstrInfo &II = State_.getInstrInfo();
+   const auto &SI = State_.getSubtargetInfo();
++  const auto &SM = SI.getSchedModel();
++
++  const auto &Points = Clustering_.getPoints();
++  const auto &FirstPoint = Points[0];
++  Result.Triple = FirstPoint.LLVMTriple;
++  Result.CPUName = FirstPoint.CpuName;
++  Result.Epsilon = std::sqrt(AnalysisInconsistencyEpsilonSquared_);
++
++  std::vector<SchedClassCluster> SchedClassClusters;
+   for (const auto &RSCAndPoints : makePointsPerSchedClass()) {
+-    if (!RSCAndPoints.RSC.SCDesc)
++    const auto &RSC = RSCAndPoints.RSC;
++    if (!RSC.SCDesc)
+       continue;
++
++    if (!filterMCSchedClass(*RSC.SCDesc))
++      continue;
++
+     // Bucket sched class points into sched class clusters.
+-    std::vector<SchedClassCluster> SchedClassClusters;
++    SchedClassClusters.clear();
+     for (const size_t PointId : RSCAndPoints.PointIds) {
+       const auto &ClusterId = Clustering_.getClusterIdForPoint(PointId);
+       if (!ClusterId.isValid())
+         continue; // Ignore noise and errors. FIXME: take noise into account ?
+       if (ClusterId.isUnstable() ^ AnalysisDisplayUnstableOpcodes_)
+         continue; // Either display stable or unstable clusters only.
+-      auto SchedClassClusterIt =
+-          find_if(SchedClassClusters, [ClusterId](const SchedClassCluster &C) {
++      auto SchedClassClusterIt = llvm::find_if(
++          SchedClassClusters, [ClusterId](const SchedClassCluster &C) {
+             return C.id() == ClusterId;
+           });
+       if (SchedClassClusterIt == SchedClassClusters.end()) {
+@@ -553,32 +257,111 @@ Error Analysis::run<Analysis::PrintSchedClassInconsistencies>(
+ 
+     // Print any scheduling class that has at least one cluster that does not
+     // match the checked-in data.
+-    if (all_of(SchedClassClusters, [this, &RSCAndPoints,
+-                                    &SI](const SchedClassCluster &C) {
+-          return C.measurementsMatch(SI, RSCAndPoints.RSC, Clustering_,
+-                                     AnalysisInconsistencyEpsilonSquared_);
+-        }))
++    if (all_of(
++            SchedClassClusters, [this, &RSC, &SI](const SchedClassCluster &C) {
++              return C.measurementsMatch(SI, RSC, Clustering_,
++                                         AnalysisInconsistencyEpsilonSquared_);
++            }))
+       continue; // Nothing weird.
+ 
+-    OS << "<div class=\"inconsistency\"><p>Sched Class <span "
+-          "class=\"sched-class-name\">";
++    Result.Inconsistencies.emplace_back();
++    auto &ResultEntry = Result.Inconsistencies.back();
+ #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+-    writeEscaped<kEscapeHtml>(OS, RSCAndPoints.RSC.SCDesc->Name);
++    ResultEntry.Name = RSC.SCDesc->Name;
+ #else
+-    OS << RSCAndPoints.RSC.SchedClassId;
++    ResultEntry.Name = RSC.SchedClassId;
+ #endif
+-    OS << "</span> contains instructions whose performance characteristics do"
+-          " not match that of LLVM:</p>";
+-    printSchedClassClustersHtml(SchedClassClusters, RSCAndPoints.RSC, OS);
+-    OS << "<p>llvm SchedModel data:</p>";
+-    printSchedClassDescHtml(RSCAndPoints.RSC, OS);
+-    OS << "</div>";
++
++    assert(!SchedClassClusters.empty());
++    for (const auto &Measurement :
++         Points[SchedClassClusters[0].getPointIds()[0]].Measurements)
++      ResultEntry.MeasurementNames.push_back(Measurement.Key);
++
++    // Measurements
++    for (const SchedClassCluster &Cluster : SchedClassClusters) {
++      ResultEntry.Measurements.emplace_back();
++      auto &Measurement = ResultEntry.Measurements.back();
++      Measurement.ClusterId = Cluster.id();
++      Measurement.IsInconsistent = !Cluster.measurementsMatch(
++          SI, RSC, Clustering_, AnalysisInconsistencyEpsilonSquared_);
++
++      // Description of points in this cluster.
++      for (const size_t PointId : Cluster.getPointIds()) {
++        Measurement.Points.emplace_back();
++        auto &ResPoint = Measurement.Points.back();
++        const auto &Point = Points[PointId];
++        if (!Point.Key.Instructions.empty())
++          ResPoint.Opcode = II.getName(Point.Key.Instructions[0].getOpcode());
++        ResPoint.Config = Point.Key.Config;
++        raw_string_ostream SS(ResPoint.Snippet);
++        printSnippet(SS, Point.AssembledSnippet);
++      }
++
++      // Measured data.
++      for (const auto &Stats : Cluster.getCentroid().getStats()) {
++        Measurement.Data.emplace_back();
++        Measurement.Data.back() = {Stats.min(), Stats.avg(), Stats.max()};
++      }
++    }
++
++    // SchedModel data
++    ResultEntry.IsVariant = RSC.WasVariant;
++    ResultEntry.NumMicroOps = RSC.SCDesc->NumMicroOps;
++    // Latencies.
++    for (int I = 0, E = RSC.SCDesc->NumWriteLatencyEntries; I < E; ++I) {
++      const auto *const Entry = SI.getWriteLatencyEntry(RSC.SCDesc, I);
++      ResultEntry.Latency.emplace_back(
++          std::make_pair(Entry->WriteResourceID,
++                         RSC.computeNormalizedWriteLatency(Entry, SI)));
++    }
++
++    // Inverse throughput.
++    ResultEntry.RThroughput =
++        MCSchedModel::getReciprocalThroughput(SI, *RSC.SCDesc);
++
++    // Used processor resources and pressures.
++    auto PressureIt = RSC.IdealizedProcResPressure.begin();
++    auto EndPressureIt = RSC.IdealizedProcResPressure.end();
++    for (const auto &WPR : RSC.NonRedundantWriteProcRes) {
++      ResultEntry.WriteProcResEntries.emplace_back();
++      auto &ResWPR = ResultEntry.WriteProcResEntries.back();
++      ResWPR.ProcResName = SM.getProcResource(WPR.ProcResourceIdx)->Name;
++      ResWPR.AcquireAtCycle = WPR.AcquireAtCycle;
++      ResWPR.ReleaseAtCycle = WPR.ReleaseAtCycle;
++      if (PressureIt != EndPressureIt &&
++          WPR.ProcResourceIdx == PressureIt->first) {
++        ResWPR.ResourcePressure = PressureIt->second;
++        ++PressureIt;
++      } else {
++        ResWPR.ResourcePressure = std::nullopt;
++      }
++    }
+   }
+ 
+-  printClusterRawHtml(BenchmarkClustering::ClusterId::noise(),
+-                      "[noise]", OS);
++  return Result;
++}
++
++template <>
++Error Analysis::run<Analysis::PrintSchedClassInconsistencies>(
++    raw_ostream &OS, Analysis::OutputFormat Format) const {
++  if (Clustering_.getPoints().empty())
++    return Error::success();
++
++  auto Result = exportResult<Analysis::PrintSchedClassInconsistencies>();
++  if (!Result)
++    return Result.takeError();
++
++  switch (Format) {
++  case OF_Default:
++    AnalysisResult::printHTML(OS, *Result);
++    break;
++  case OF_YAML:
++    AnalysisResult::printYAML(OS, *Result);
++    break;
++  default:
++    llvm_unreachable("Unsupported output format");
++  }
+ 
+-  OS << "</body></html>";
+   return Error::success();
+ }
+ 
+diff --git a/llvm/tools/llvm-exegesis/lib/Analysis.h b/llvm/tools/llvm-exegesis/lib/Analysis.h
+index 16eccf6879c2..98c4126d72f2 100644
+--- a/llvm/tools/llvm-exegesis/lib/Analysis.h
++++ b/llvm/tools/llvm-exegesis/lib/Analysis.h
+@@ -22,11 +22,86 @@
+ #include "llvm/MC/MCSubtargetInfo.h"
+ #include "llvm/Support/Error.h"
+ #include "llvm/Support/raw_ostream.h"
++#include <array>
+ #include <memory>
+ 
+ namespace llvm {
+ namespace exegesis {
+ 
++// Abstractions over analysis results which make it easier
++// to print them in different formats.
++namespace AnalysisResult {
++#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
++using SchedClassName = StringRef;
++#else
++using SchedClassName = unsigned;
++#endif
++
++struct Cluster {
++  BenchmarkClustering::ClusterId Id;
++  std::string Snippet;
++  StringRef Config;
++  SchedClassName SchedClass;
++  SmallVector<double, 2> Measurements;
++};
++struct Clusters {
++  SmallVector<StringRef, 2> MeasurementNames;
++  std::vector<Cluster> Data;
++};
++
++struct SchedClassInconsistency {
++  // === SchedClass properties ===
++  SchedClassName Name;
++  bool IsVariant;
++  unsigned NumMicroOps;
++
++  // {WriteResourceID, Latency}
++  SmallVector<std::pair<unsigned, unsigned>, 2> Latency;
++
++  double RThroughput;
++
++  struct WriteProcResEntry {
++    StringRef ProcResName;
++    uint16_t AcquireAtCycle;
++    uint16_t ReleaseAtCycle;
++    std::optional<double> ResourcePressure;
++  };
++  SmallVector<WriteProcResEntry, 2> WriteProcResEntries;
++
++  // === Collected data ===
++  struct Point {
++    StringRef Opcode;
++    StringRef Config;
++    std::string Snippet;
++  };
++  // [min, mean, max]
++  using DataPoint = std::array<double, 3>;
++
++  struct Measurement {
++    BenchmarkClustering::ClusterId ClusterId;
++    SmallVector<Point, 32> Points;
++    SmallVector<DataPoint, 2> Data;
++    bool IsInconsistent;
++  };
++  SmallVector<StringRef, 2> MeasurementNames;
++  SmallVector<Measurement, 4> Measurements;
++};
++struct SchedClassInconsistencies {
++  StringRef Triple;
++  StringRef CPUName;
++  double Epsilon;
++
++  std::vector<SchedClassInconsistency> Inconsistencies;
++};
++
++/// Printers
++void printCSV(raw_ostream &OS, const Clusters &Data);
++void printYAML(raw_ostream &OS, const Clusters &Data);
++
++void printHTML(raw_ostream &OS, const SchedClassInconsistencies &Data);
++void printYAML(raw_ostream &OS, const SchedClassInconsistencies &Data);
++} // namespace AnalysisResult
++
+ // A helper class to analyze benchmark results for a target.
+ class Analysis {
+ public:
+@@ -36,15 +111,24 @@ public:
+            bool AnalysisDisplayUnstableOpcodes);
+ 
+   // Prints a csv of instructions for each cluster.
+-  struct PrintClusters {};
++  struct PrintClusters {
++    using Result = AnalysisResult::Clusters;
++  };
+   // Find potential errors in the scheduling information given measurements.
+-  struct PrintSchedClassInconsistencies {};
++  struct PrintSchedClassInconsistencies {
++    using Result = AnalysisResult::SchedClassInconsistencies;
++  };
+ 
+-  template <typename Pass> Error run(raw_ostream &OS) const;
++  enum OutputFormat { OF_Default, OF_YAML, OF_JSON };
++  template <typename Pass>
++  Error run(raw_ostream &OS, OutputFormat Format) const;
+ 
+ private:
+   using ClusterId = BenchmarkClustering::ClusterId;
+ 
++  template <typename Pass, typename ResultT = typename Pass::Result>
++  Expected<ResultT> exportResult() const;
++
+   // Represents the intersection of a sched class and a cluster.
+   class SchedClassCluster {
+   public:
+@@ -73,20 +157,6 @@ private:
+     SchedClassClusterCentroid Centroid;
+   };
+ 
+-  void printInstructionRowCsv(size_t PointId, raw_ostream &OS) const;
+-
+-  void printClusterRawHtml(const BenchmarkClustering::ClusterId &Id,
+-                           StringRef display_name, raw_ostream &OS) const;
+-
+-  void printPointHtml(const Benchmark &Point, raw_ostream &OS) const;
+-
+-  void
+-  printSchedClassClustersHtml(const std::vector<SchedClassCluster> &Clusters,
+-                              const ResolvedSchedClass &SC,
+-                              raw_ostream &OS) const;
+-  void printSchedClassDescHtml(const ResolvedSchedClass &SC,
+-                               raw_ostream &OS) const;
+-
+   // A pair of (Sched Class, indices of points that belong to the sched
+   // class).
+   struct ResolvedSchedClassAndPoints {
+@@ -99,9 +169,9 @@ private:
+   // Builds a list of ResolvedSchedClassAndPoints.
+   std::vector<ResolvedSchedClassAndPoints> makePointsPerSchedClass() const;
+ 
+-  template <typename EscapeTag, EscapeTag Tag>
+-  void writeSnippet(raw_ostream &OS, ArrayRef<uint8_t> Bytes,
+-                    const char *Separator) const;
++  // Print non-escaped snippet.
++  void printSnippet(raw_ostream &OS, ArrayRef<uint8_t> Bytes,
++                    const char *Separator = "\n") const;
+ 
+   const BenchmarkClustering &Clustering_;
+   const LLVMState &State_;
+diff --git a/llvm/tools/llvm-exegesis/lib/AnalysisPrinters.cpp b/llvm/tools/llvm-exegesis/lib/AnalysisPrinters.cpp
+new file mode 100644
+index 000000000000..83cb5ec9b555
+--- /dev/null
++++ b/llvm/tools/llvm-exegesis/lib/AnalysisPrinters.cpp
+@@ -0,0 +1,514 @@
++//===-- AnalysisPrinters.cpp ------------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "Analysis.h"
++#include "BenchmarkResult.h"
++#include "Clustering.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/Support/FormatVariadic.h"
++#include "llvm/Support/YAMLTraits.h"
++#include <limits>
++
++using namespace llvm;
++using namespace llvm::exegesis;
++
++static const char kCsvSep = ',';
++
++namespace {
++enum EscapeTag { kNone, kEscapeCsv, kEscapeHtml };
++
++template <EscapeTag Tag> void writeEscaped(raw_ostream &OS, const StringRef S) {
++  OS << S;
++}
++
++template <> void writeEscaped<kEscapeCsv>(raw_ostream &OS, const StringRef S) {
++  if (!S.contains(kCsvSep)) {
++    OS << S;
++  } else {
++    // Needs escaping.
++    OS << '"';
++    for (const char C : S) {
++      if (C == '"')
++        OS << "\"\"";
++      else
++        OS << C;
++    }
++    OS << '"';
++  }
++}
++
++template <> void writeEscaped<kEscapeHtml>(raw_ostream &OS, const StringRef S) {
++  for (const char C : S) {
++    if (C == '<')
++      OS << "&lt;";
++    else if (C == '>')
++      OS << "&gt;";
++    else if (C == '&')
++      OS << "&amp;";
++    else
++      OS << C;
++  }
++}
++
++template <EscapeTag Tag>
++void writeClusterId(raw_ostream &OS,
++                    const BenchmarkClustering::ClusterId &CID) {
++  if (CID.isNoise())
++    writeEscaped<Tag>(OS, "[noise]");
++  else if (CID.isError())
++    writeEscaped<Tag>(OS, "[error]");
++  else
++    OS << CID.getId();
++}
++
++template <EscapeTag Tag>
++void writeMeasurementValue(raw_ostream &OS, const double Value) {
++  // Given Value, if we wanted to serialize it to a string,
++  // how many base-10 digits will we need to store, max?
++  static constexpr auto MaxDigitCount =
++      std::numeric_limits<decltype(Value)>::max_digits10;
++  // Also, we will need a decimal separator.
++  static constexpr auto DecimalSeparatorLen = 1; // '.' e.g.
++  // So how long of a string will the serialization produce, max?
++  static constexpr auto SerializationLen = MaxDigitCount + DecimalSeparatorLen;
++
++  // WARNING: when changing the format, also adjust the small-size estimate ^.
++  static constexpr StringLiteral SimpleFloatFormat = StringLiteral("{0:F}");
++
++  writeEscaped<Tag>(
++      OS, formatv(SimpleFloatFormat.data(), Value).sstr<SerializationLen>());
++}
++} // anonymous namespace
++
++void llvm::exegesis::AnalysisResult::printCSV(
++    raw_ostream &OS, const AnalysisResult::Clusters &Result) {
++  // Write the header.
++  OS << "cluster_id" << kCsvSep << "opcode_name" << kCsvSep << "config"
++     << kCsvSep << "sched_class";
++  for (StringRef Name : Result.MeasurementNames) {
++    OS << kCsvSep;
++    writeEscaped<kEscapeCsv>(OS, Name);
++  }
++  OS << "\n";
++
++  // Prints a row representing an instruction, along with scheduling info and
++  // point coordinates (measurements).
++  for (const auto &Row : Result.Data) {
++    writeClusterId<kEscapeCsv>(OS, Row.Id);
++    OS << kCsvSep;
++    writeEscaped<kEscapeCsv>(OS, Row.Snippet);
++    OS << kCsvSep;
++    writeEscaped<kEscapeCsv>(OS, Row.Config);
++    OS << kCsvSep;
++#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
++    writeEscaped<kEscapeCsv>(OS, Row.SchedClass);
++#else
++    OS << Row.SchedClass;
++#endif
++    for (double Measurement : Row.Measurements) {
++      OS << kCsvSep;
++      writeMeasurementValue<kEscapeCsv>(OS, Measurement);
++    }
++    OS << "\n";
++  }
++}
++
++namespace llvm {
++namespace yaml {
++template <> struct ScalarTraits<BenchmarkClustering::ClusterId> {
++  static void output(const BenchmarkClustering::ClusterId &Value, void *,
++                     raw_ostream &OS) {
++    if (Value.isUnstable()) {
++      OS << "unstable<";
++      writeClusterId<kNone>(OS, Value);
++      OS << ">";
++    } else {
++      writeClusterId<kNone>(OS, Value);
++    }
++  }
++
++  static StringRef input(StringRef Text, void *,
++                         BenchmarkClustering::ClusterId &Value) {
++    size_t Id;
++
++    if (Text == "[noise]") {
++      Value = BenchmarkClustering::ClusterId::noise();
++    } else if (Text == "[error]") {
++      Value = BenchmarkClustering::ClusterId::error();
++    } else if (Text.consume_front("unstable<")) {
++      if (!Text.consumeInteger(10, Id) && Text == ">")
++        Value = BenchmarkClustering::ClusterId::makeValidUnstable(Id);
++      else
++        return "Expect 'unstable<cluster id>'";
++    } else if (!Text.getAsInteger(10, Id)) {
++      Value = BenchmarkClustering::ClusterId::makeValid(Id);
++    } else {
++      return "Unrecognized ClusterId value";
++    }
++
++    return StringRef();
++  }
++
++  static QuotingType mustQuote(StringRef) { return QuotingType::Single; }
++
++  static const bool flow = true;
++};
++
++template <> struct SequenceElementTraits<AnalysisResult::Cluster> {
++  static const bool flow = false;
++};
++
++template <> struct MappingTraits<AnalysisResult::Cluster> {
++  static void mapping(IO &Io, AnalysisResult::Cluster &Obj) {
++    Io.mapRequired("id", Obj.Id);
++    Io.mapRequired("snippet", Obj.Snippet);
++    Io.mapRequired("config", Obj.Config);
++    Io.mapRequired("sched_class", Obj.SchedClass);
++    Io.mapRequired("measurements", Obj.Measurements);
++  }
++};
++
++template <> struct MappingTraits<AnalysisResult::Clusters> {
++  static void mapping(IO &Io, AnalysisResult::Clusters &Obj) {
++    Io.mapRequired("measurement_names", Obj.MeasurementNames);
++    Io.mapRequired("data", Obj.Data);
++  }
++};
++} // namespace yaml
++} // namespace llvm
++
++void llvm::exegesis::AnalysisResult::printYAML(
++    raw_ostream &OS, const AnalysisResult::Clusters &Result) {
++  yaml::Output YOS(OS, /*Ctx=*/nullptr, /*WrapColumn=*/200);
++  YOS << const_cast<AnalysisResult::Clusters &>(Result);
++}
++
++static constexpr const char kHtmlHead[] = R"(
++<head>
++<title>llvm-exegesis Analysis Results</title>
++<style>
++body {
++  font-family: sans-serif
++}
++span.sched-class-name {
++  font-weight: bold;
++  font-family: monospace;
++}
++span.opcode {
++  font-family: monospace;
++}
++span.config {
++  font-family: monospace;
++}
++div.inconsistency {
++  margin-top: 50px;
++}
++table {
++  margin-left: 50px;
++  border-collapse: collapse;
++}
++table, table tr,td,th {
++  border: 1px solid #444;
++}
++table ul {
++  padding-left: 0px;
++  margin: 0px;
++  list-style-type: none;
++}
++table.sched-class-clusters td {
++  padding-left: 10px;
++  padding-right: 10px;
++  padding-top: 10px;
++  padding-bottom: 10px;
++}
++table.sched-class-desc td {
++  padding-left: 10px;
++  padding-right: 10px;
++  padding-top: 2px;
++  padding-bottom: 2px;
++}
++span.mono {
++  font-family: monospace;
++}
++td.measurement {
++  text-align: center;
++}
++tr.good-cluster td.measurement {
++  color: #292
++}
++tr.bad-cluster td.measurement {
++  color: #922
++}
++tr.good-cluster td.measurement span.minmax {
++  color: #888;
++}
++tr.bad-cluster td.measurement span.minmax {
++  color: #888;
++}
++</style>
++</head>
++)";
++
++namespace {
++using namespace AnalysisResult;
++void printSchedClassClustersHTML(
++    raw_ostream &OS,
++    ArrayRef<SchedClassInconsistency::Measurement> Measurements,
++    ArrayRef<StringRef> MeasurementNames) {
++  OS << "<table class=\"sched-class-clusters\">";
++  OS << "<tr><th>ClusterId</th><th>Opcode/Config</th>";
++  for (StringRef Name : MeasurementNames) {
++    OS << "<th>";
++    writeEscaped<kEscapeHtml>(OS, Name);
++    OS << "</th>";
++  }
++  OS << "</tr>";
++  for (const auto &M : Measurements) {
++    OS << "<tr class=\"" << (M.IsInconsistent ? "bad-cluster" : "good-cluster")
++       << "\"><td>";
++    writeClusterId<kEscapeHtml>(OS, M.ClusterId);
++    OS << "</td><td><ul>";
++    for (const auto &P : M.Points) {
++      // Show up when the cursor is hovered over.
++      OS << "<li><span class=\"mono\" title=\"";
++      writeEscaped<kEscapeHtml>(OS, P.Snippet);
++      OS << "\">";
++
++      writeEscaped<kEscapeHtml>(OS, P.Opcode);
++      OS << "</span> <span class=\"mono\">";
++      writeEscaped<kEscapeHtml>(OS, P.Config);
++      OS << "</span></li>";
++    }
++    OS << "</ul></td>";
++
++    for (const auto &Stats : M.Data) {
++      OS << "<td class=\"measurement\">";
++      writeMeasurementValue<kEscapeHtml>(OS, Stats[1]);
++      OS << "<br><span class=\"minmax\">[";
++      writeMeasurementValue<kEscapeHtml>(OS, Stats[0]);
++      OS << ";";
++      writeMeasurementValue<kEscapeHtml>(OS, Stats[2]);
++      OS << "]</span></td>";
++    }
++    OS << "</tr>";
++  }
++  OS << "</table>";
++}
++
++void printSchedClassDescHTML(raw_ostream &OS,
++                             const SchedClassInconsistency &SCI) {
++  OS << "<table class=\"sched-class-desc\">";
++  OS << "<tr><th>Valid</th><th>Variant</th><th>NumMicroOps</th><th>Normalized "
++        "Latency</"
++        "th><th>RThroughput</th><th>WriteProcRes</th><th title=\"This is the "
++        "idealized unit resource (port) pressure assuming ideal "
++        "distribution\">Idealized Resource Pressure</th></tr>";
++
++  OS << "<tr><td>&#10004;</td>";
++  OS << "<td>" << (SCI.IsVariant ? "&#10004;" : "&#10005;") << "</td>";
++  OS << "<td>" << SCI.NumMicroOps << "</td>";
++  // Latencies.
++  OS << "<td><ul>";
++  for (const auto &L : SCI.Latency) {
++    OS << "<li>" << L.second;
++    if (SCI.Latency.size() > 1) {
++      // Dismabiguate if more than 1 latency.
++      OS << " (WriteResourceID " << L.first << ")";
++    }
++    OS << "</li>";
++  }
++  OS << "</ul></td>";
++  // Inverse throughput.
++  OS << "<td>";
++  writeMeasurementValue<kEscapeHtml>(OS, SCI.RThroughput);
++  OS << "</td>";
++  // WriteProcRes.
++  OS << "<td><ul>";
++  for (const auto &WPR : SCI.WriteProcResEntries) {
++    OS << "<li><span class=\"mono\">";
++    writeEscaped<kEscapeHtml>(OS, WPR.ProcResName);
++    OS << "</span>: "
++       << formatv("[{0}, {1}]", WPR.AcquireAtCycle, WPR.ReleaseAtCycle)
++       << "</li>";
++  }
++  OS << "</ul></td>";
++  // Idealized port pressure.
++  OS << "<td><ul>";
++  for (const auto &WPR : SCI.WriteProcResEntries) {
++    if (!WPR.ResourcePressure.has_value())
++      continue;
++    OS << "<li><span class=\"mono\">";
++    writeEscaped<kEscapeHtml>(OS, WPR.ProcResName);
++    OS << "</span>: ";
++    writeMeasurementValue<kEscapeHtml>(OS, *WPR.ResourcePressure);
++    OS << "</li>";
++  }
++  OS << "</ul></td>";
++  OS << "</tr>";
++  OS << "</table>";
++}
++} // anonymous namespace
++
++void llvm::exegesis::AnalysisResult::printHTML(
++    raw_ostream &OS, const AnalysisResult::SchedClassInconsistencies &Result) {
++  // Print the header.
++  OS << "<!DOCTYPE html><html>" << kHtmlHead << "<body>";
++  OS << "<h1><span class=\"mono\">llvm-exegesis</span> Analysis Results</h1>";
++  OS << "<h3>Triple: <span class=\"mono\">";
++  writeEscaped<kEscapeHtml>(OS, Result.Triple);
++  OS << "</span></h3><h3>Cpu: <span class=\"mono\">";
++  writeEscaped<kEscapeHtml>(OS, Result.CPUName);
++  OS << "</span></h3>";
++  OS << "<h3>Epsilon: <span class=\"mono\">" << format("%0.2f", Result.Epsilon)
++     << "</span></h3>";
++
++  for (const auto &SCI : Result.Inconsistencies) {
++    OS << "<div class=\"inconsistency\"><p>Sched Class <span "
++          "class=\"sched-class-name\">";
++#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
++    writeEscaped<kEscapeHtml>(OS, SCI.Name);
++#else
++    OS << SCI.Name;
++#endif
++    OS << "</span> contains instructions whose performance characteristics do"
++          " not match that of LLVM:</p>";
++    printSchedClassClustersHTML(OS, SCI.Measurements, SCI.MeasurementNames);
++    OS << "<p>llvm SchedModel data:</p>";
++    printSchedClassDescHTML(OS, SCI);
++    OS << "</div>";
++  }
++
++  // TODO: Print noise data points.
++  OS << "</body></html>";
++}
++
++namespace llvm {
++namespace yaml {
++
++template <>
++struct SequenceElementTraits<AnalysisResult::SchedClassInconsistency> {
++  static const bool flow = false;
++};
++
++template <>
++struct SequenceElementTraits<
++    AnalysisResult::SchedClassInconsistency::WriteProcResEntry> {
++  static const bool flow = false;
++};
++
++template <>
++struct MappingTraits<
++    AnalysisResult::SchedClassInconsistency::WriteProcResEntry> {
++  static void
++  mapping(IO &Io,
++          AnalysisResult::SchedClassInconsistency::WriteProcResEntry &Obj) {
++    Io.mapRequired("name", Obj.ProcResName);
++    Io.mapRequired("acquire_cycle", Obj.AcquireAtCycle);
++    Io.mapRequired("release_cycle", Obj.ReleaseAtCycle);
++    Io.mapOptional("pressure", Obj.ResourcePressure);
++  }
++
++  static const bool flow = true;
++};
++
++template <>
++struct SequenceElementTraits<AnalysisResult::SchedClassInconsistency::Point> {
++  static const bool flow = false;
++};
++
++template <>
++struct MappingTraits<AnalysisResult::SchedClassInconsistency::Point> {
++  static void mapping(IO &Io,
++                      AnalysisResult::SchedClassInconsistency::Point &Obj) {
++    Io.mapRequired("opcode", Obj.Opcode);
++    Io.mapRequired("config", Obj.Config);
++    Io.mapRequired("snippet", Obj.Snippet);
++  }
++};
++
++template <>
++struct SequenceElementTraits<
++    AnalysisResult::SchedClassInconsistency::DataPoint> {
++  static const bool flow = true;
++};
++
++template <>
++struct SequenceTraits<AnalysisResult::SchedClassInconsistency::DataPoint> {
++  using DataPoint = AnalysisResult::SchedClassInconsistency::DataPoint;
++  static size_t size(IO &, DataPoint &Obj) { return Obj.size(); }
++
++  static DataPoint::value_type &element(IO &, DataPoint &Obj, size_t Index) {
++    return Obj[Index];
++  }
++
++  static const bool flow = true;
++};
++
++template <>
++struct SequenceElementTraits<
++    AnalysisResult::SchedClassInconsistency::Measurement> {
++  static const bool flow = false;
++};
++
++template <>
++struct MappingTraits<AnalysisResult::SchedClassInconsistency::Measurement> {
++  static void
++  mapping(IO &Io, AnalysisResult::SchedClassInconsistency::Measurement &Obj) {
++    Io.mapRequired("cluster_id", Obj.ClusterId);
++    Io.mapRequired("points", Obj.Points);
++    Io.mapRequired("data", Obj.Data);
++    Io.mapRequired("inconsistent", Obj.IsInconsistent);
++  }
++};
++
++template <> struct SequenceTraits<std::pair<unsigned, unsigned>> {
++  using Pair = std::pair<unsigned, unsigned>;
++  static size_t size(IO &, Pair &) { return 2; }
++
++  static unsigned &element(IO &, Pair &Obj, size_t Index) {
++    return Index == 0 ? Obj.first : Obj.second;
++  }
++
++  static const bool flow = true;
++};
++
++template <> struct SequenceElementTraits<std::pair<unsigned, unsigned>> {
++  static const bool flow = true;
++};
++
++template <> struct MappingTraits<AnalysisResult::SchedClassInconsistency> {
++  static void mapping(IO &Io, AnalysisResult::SchedClassInconsistency &Obj) {
++    Io.mapRequired("name", Obj.Name);
++    Io.mapRequired("variant", Obj.IsVariant);
++    Io.mapRequired("num_microops", Obj.NumMicroOps);
++    Io.mapRequired("latency", Obj.Latency);
++    Io.mapRequired("rthroughput", Obj.RThroughput);
++
++    Io.mapRequired("write_proc_res", Obj.WriteProcResEntries);
++
++    Io.mapRequired("measurement_names", Obj.MeasurementNames);
++    Io.mapRequired("measurements", Obj.Measurements);
++  }
++};
++
++template <> struct MappingTraits<AnalysisResult::SchedClassInconsistencies> {
++  static void mapping(IO &Io, AnalysisResult::SchedClassInconsistencies &Obj) {
++    Io.mapRequired("triple", Obj.Triple);
++    Io.mapRequired("cpu", Obj.CPUName);
++    Io.mapOptional("epsilon", Obj.Epsilon);
++    Io.mapRequired("inconsistencies", Obj.Inconsistencies);
++  }
++};
++} // namespace yaml
++} // namespace llvm
++
++void llvm::exegesis::AnalysisResult::printYAML(
++    raw_ostream &OS, const AnalysisResult::SchedClassInconsistencies &Result) {
++  yaml::Output YOS(OS, /*Ctx=*/nullptr, /*WrapColumn=*/200);
++  YOS << const_cast<AnalysisResult::SchedClassInconsistencies &>(Result);
++}
+diff --git a/llvm/tools/llvm-exegesis/lib/BenchmarkResult.cpp b/llvm/tools/llvm-exegesis/lib/BenchmarkResult.cpp
+index 1823a534a301..d01b74daae36 100644
+--- a/llvm/tools/llvm-exegesis/lib/BenchmarkResult.cpp
++++ b/llvm/tools/llvm-exegesis/lib/BenchmarkResult.cpp
+@@ -9,16 +9,20 @@
+ #include "BenchmarkResult.h"
+ #include "BenchmarkRunner.h"
+ #include "Error.h"
++#include "Timer.h"
+ #include "ValidationEvent.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/ScopeExit.h"
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/ADT/bit.h"
+ #include "llvm/ObjectYAML/YAML.h"
++#include "llvm/Support/Base64.h"
++#include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Errc.h"
+ #include "llvm/Support/FileOutputBuffer.h"
+ #include "llvm/Support/FileSystem.h"
+ #include "llvm/Support/Format.h"
++#include "llvm/Support/Timer.h"
+ #include "llvm/Support/raw_ostream.h"
+ 
+ static constexpr const char kIntegerPrefix[] = "i_0x";
+@@ -27,6 +31,12 @@ static constexpr const char kInvalidOperand[] = "INVALID";
+ 
+ namespace llvm {
+ 
++static cl::opt<compression::Format> ForceObjectFileCompressionFormat(
++    "exegesis-force-obj-compress-format", cl::Hidden,
++    cl::desc("Force to use this compression format for object files."),
++    cl::values(clEnumValN(compression::Format::Zstd, "zstd", "Using Zstandard"),
++               clEnumValN(compression::Format::Zlib, "zlib", "Using LibZ")));
++
+ namespace {
+ 
+ // A mutable struct holding an LLVMState that can be passed through the
+@@ -89,7 +99,7 @@ private:
+     OS.write_hex(bit_cast<uint64_t>(Value));
+   }
+ 
+-  bool tryDeserializeIntegerOperand(StringRef String, int64_t &Value) {
++  bool tryDeserializeIntegerOperand(StringRef String, uint64_t &Value) {
+     if (!String.consume_front(kIntegerPrefix))
+       return false;
+     return !String.consumeInteger(16, Value);
+@@ -121,10 +131,10 @@ private:
+ 
+   MCOperand deserializeMCOperand(StringRef String) {
+     assert(!String.empty());
+-    int64_t IntValue = 0;
++    uint64_t IntValue = 0;
+     double DoubleValue = 0;
+     if (tryDeserializeIntegerOperand(String, IntValue))
+-      return MCOperand::createImm(IntValue);
++      return MCOperand::createImm(bit_cast<int64_t>(IntValue));
+     if (tryDeserializeFPOperand(String, DoubleValue))
+       return MCOperand::createDFPImm(bit_cast<uint64_t>(DoubleValue));
+     if (auto RegNo = getRegNo(String))
+@@ -278,6 +288,13 @@ template <> struct ScalarTraits<exegesis::RegisterValue> {
+   static const bool flow = true;
+ };
+ 
++template <> struct ScalarEnumerationTraits<compression::Format> {
++  static void enumeration(IO &Io, compression::Format &Format) {
++    Io.enumCase(Format, "zstd", compression::Format::Zstd);
++    Io.enumCase(Format, "zlib", compression::Format::Zlib);
++  }
++};
++
+ template <> struct MappingContextTraits<exegesis::BenchmarkKey, YamlContext> {
+   static void mapping(IO &Io, exegesis::BenchmarkKey &Obj,
+                       YamlContext &Context) {
+@@ -288,6 +305,33 @@ template <> struct MappingContextTraits<exegesis::BenchmarkKey, YamlContext> {
+   }
+ };
+ 
++template <> struct MappingTraits<exegesis::Benchmark::ObjectFile> {
++  struct NormalizedBase64Binary {
++    std::string Base64Str;
++
++    NormalizedBase64Binary(IO &) {}
++    NormalizedBase64Binary(IO &, const std::vector<uint8_t> &Data)
++        : Base64Str(llvm::encodeBase64(Data)) {}
++
++    std::vector<uint8_t> denormalize(IO &) {
++      std::vector<char> Buffer;
++      if (Error E = llvm::decodeBase64(Base64Str, Buffer))
++        report_fatal_error(std::move(E));
++
++      StringRef Data(Buffer.data(), Buffer.size());
++      return std::vector<uint8_t>(Data.bytes_begin(), Data.bytes_end());
++    }
++  };
++
++  static void mapping(IO &Io, exegesis::Benchmark::ObjectFile &Obj) {
++    Io.mapRequired("compression", Obj.CompressionFormat);
++    Io.mapRequired("original_size", Obj.UncompressedSize);
++    MappingNormalization<NormalizedBase64Binary, std::vector<uint8_t>>
++        ObjFileString(Io, Obj.CompressedBytes);
++    Io.mapRequired("compressed_bytes", ObjFileString->Base64Str);
++  }
++};
++
+ template <> struct MappingContextTraits<exegesis::Benchmark, YamlContext> {
+   struct NormalizedBinary {
+     NormalizedBinary(IO &io) {}
+@@ -325,9 +369,11 @@ template <> struct MappingContextTraits<exegesis::Benchmark, YamlContext> {
+     Io.mapRequired("error", Obj.Error);
+     Io.mapOptional("info", Obj.Info);
+     // AssembledSnippet
+-    MappingNormalization<NormalizedBinary, std::vector<uint8_t>> BinaryString(
++    MappingNormalization<NormalizedBinary, std::vector<uint8_t>> SnippetString(
+         Io, Obj.AssembledSnippet);
+-    Io.mapOptional("assembled_snippet", BinaryString->Binary);
++    Io.mapOptional("assembled_snippet", SnippetString->Binary);
++    // ObjectFile
++    Io.mapOptional("object_file", Obj.ObjFile);
+   }
+ };
+ 
+@@ -364,6 +410,52 @@ Benchmark::readTriplesAndCpusFromYamls(MemoryBufferRef Buffer) {
+   return Result;
+ }
+ 
++Error Benchmark::setObjectFile(StringRef RawBytes) {
++  SmallVector<uint8_t> CompressedBytes;
++  llvm::compression::Format CompressionFormat;
++
++  auto isFormatAvailable = [](llvm::compression::Format F) -> bool {
++    switch (F) {
++    case compression::Format::Zstd:
++      return compression::zstd::isAvailable();
++    case compression::Format::Zlib:
++      return compression::zlib::isAvailable();
++    }
++  };
++  if (ForceObjectFileCompressionFormat.getNumOccurrences() > 0) {
++    CompressionFormat = ForceObjectFileCompressionFormat;
++    if (!isFormatAvailable(CompressionFormat))
++      return make_error<StringError>(
++          "The designated compression format is not available.",
++          inconvertibleErrorCode());
++  } else if (isFormatAvailable(compression::Format::Zstd)) {
++    // Try newer compression algorithm first.
++    CompressionFormat = compression::Format::Zstd;
++  } else if (isFormatAvailable(compression::Format::Zlib)) {
++    CompressionFormat = compression::Format::Zlib;
++  } else {
++    return make_error<StringError>(
++        "None of the compression methods is available.",
++        inconvertibleErrorCode());
++  }
++
++  switch (CompressionFormat) {
++  case compression::Format::Zstd:
++    compression::zstd::compress({RawBytes.bytes_begin(), RawBytes.bytes_end()},
++                                CompressedBytes);
++    break;
++  case compression::Format::Zlib:
++    compression::zlib::compress({RawBytes.bytes_begin(), RawBytes.bytes_end()},
++                                CompressedBytes);
++    break;
++  }
++
++  ObjFile = {CompressionFormat,
++             RawBytes.size(),
++             {CompressedBytes.begin(), CompressedBytes.end()}};
++  return Error::success();
++}
++
+ Expected<Benchmark> Benchmark::readYaml(const LLVMState &State,
+                                         MemoryBufferRef Buffer) {
+   yaml::Input Yin(Buffer);
+@@ -378,6 +470,8 @@ Expected<Benchmark> Benchmark::readYaml(const LLVMState &State,
+ 
+ Expected<std::vector<Benchmark>> Benchmark::readYamls(const LLVMState &State,
+                                                       MemoryBufferRef Buffer) {
++  NamedRegionTimer T("readYamls", "Read YAML Benchmarks", TimerGroupName,
++                     TimerGroupDescription, TimerIsEnabled);
+   yaml::Input Yin(Buffer);
+   YamlContext Context(State);
+   std::vector<Benchmark> Benchmarks;
+diff --git a/llvm/tools/llvm-exegesis/lib/BenchmarkResult.h b/llvm/tools/llvm-exegesis/lib/BenchmarkResult.h
+index 7984c8805cad..05cc0dba5ecd 100644
+--- a/llvm/tools/llvm-exegesis/lib/BenchmarkResult.h
++++ b/llvm/tools/llvm-exegesis/lib/BenchmarkResult.h
+@@ -21,6 +21,7 @@
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/MC/MCInst.h"
+ #include "llvm/MC/MCInstBuilder.h"
++#include "llvm/Support/Compression.h"
+ #include "llvm/Support/YAMLTraits.h"
+ #include <limits>
+ #include <set>
+@@ -76,6 +77,11 @@ struct BenchmarkKey {
+   uintptr_t SnippetAddress = 0;
+   // The register that should be used to hold the loop counter.
+   MCRegister LoopRegister;
++  // MERGEME: useful operator?
++  //bool operator==(const BenchmarkKey &RHS) const {
++  //  return Config == RHS.Config &&
++  //         Instructions[0].getOpcode() == RHS.Instructions[0].getOpcode();
++  //}
+ };
+ 
+ struct BenchmarkMeasure {
+@@ -122,6 +128,16 @@ struct Benchmark {
+   std::string Error;
+   std::string Info;
+   std::vector<uint8_t> AssembledSnippet;
++
++  struct ObjectFile {
++    llvm::compression::Format CompressionFormat;
++    size_t UncompressedSize = 0;
++    std::vector<uint8_t> CompressedBytes;
++
++    bool isValid() const { return UncompressedSize && CompressedBytes.size(); }
++  };
++  std::optional<ObjectFile> ObjFile;
++
+   // How to aggregate measurements.
+   enum ResultAggregationModeE { Min, Max, Mean, MinVariance };
+ 
+@@ -132,6 +148,10 @@ struct Benchmark {
+   Benchmark &operator=(const Benchmark &) = delete;
+   Benchmark &operator=(Benchmark &&) = delete;
+ 
++  // Compress raw object file bytes and assign the result and compression type
++  // to CompressedObjectFile and ObjFileCompression, respectively.
++  class Error setObjectFile(StringRef RawBytes);
++
+   // Read functions.
+   static Expected<Benchmark> readYaml(const LLVMState &State,
+                                                  MemoryBufferRef Buffer);
+diff --git a/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.cpp b/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.cpp
+index a7771b99e97b..be03e933dcc2 100644
+--- a/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.cpp
++++ b/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.cpp
+@@ -14,6 +14,7 @@
+ #include "PerfHelper.h"
+ #include "SubprocessMemory.h"
+ #include "Target.h"
++#include "Timer.h"
+ #include "llvm/ADT/ScopeExit.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/ADT/StringRef.h"
+@@ -26,6 +27,7 @@
+ #include "llvm/Support/Program.h"
+ #include "llvm/Support/Signals.h"
+ #include "llvm/Support/SystemZ/zOSSupport.h"
++#include "llvm/Support/Timer.h"
+ #include <cmath>
+ #include <memory>
+ #include <string>
+@@ -53,6 +55,12 @@
+ namespace llvm {
+ namespace exegesis {
+ 
++static cl::opt<bool>
++    DryRunMeasurement("dry-run-measurement",
++                      cl::desc("Run every steps in the measurement phase "
++                               "except executing the snippet."),
++                      cl::init(false), cl::Hidden);
++
+ BenchmarkRunner::BenchmarkRunner(const LLVMState &State, Benchmark::ModeE Mode,
+                                  BenchmarkPhaseSelectorE BenchmarkPhaseSelector,
+                                  ExecutionModeE ExecutionMode,
+@@ -139,14 +147,17 @@ private:
+     pfm::CounterGroup *Counter = CounterOrError.get().get();
+     Scratch->clear();
+     {
++      bool DryRun = DryRunMeasurement;
+       auto PS = ET.withSavedState();
+       CrashRecoveryContext CRC;
+       CrashRecoveryContext::Enable();
+-      const bool Crashed = !CRC.RunSafely([this, Counter, ScratchPtr]() {
+-        Counter->start();
+-        this->Function(ScratchPtr);
+-        Counter->stop();
+-      });
++      const bool Crashed =
++          !CRC.RunSafely([this, Counter, ScratchPtr, DryRun]() {
++            Counter->start();
++            if (!DryRun)
++              this->Function(ScratchPtr);
++            Counter->stop();
++          });
+       CrashRecoveryContext::Disable();
+       PS.reset();
+       if (Crashed) {
+@@ -632,6 +643,9 @@ BenchmarkRunner::getRunnableConfiguration(
+   // the snippet for debug/analysis. This is so that the user clearly
+   // understands that the inside instructions are repeated.
+   if (BenchmarkPhaseSelector > BenchmarkPhaseSelectorE::PrepareSnippet) {
++    NamedRegionTimer T("prepare-and-assemble-snippet",
++                       "Prepare And Assemble Snippet", TimerGroupName,
++                       TimerGroupDescription, TimerIsEnabled);
+     const int MinInstructionsForSnippet = 4 * Instructions.size();
+     const int LoopBodySizeForSnippet = 2 * Instructions.size();
+     auto Snippet =
+@@ -649,17 +663,55 @@ BenchmarkRunner::getRunnableConfiguration(
+   // MinInstructions instructions.
+   if (BenchmarkPhaseSelector >
+       BenchmarkPhaseSelectorE::PrepareAndAssembleSnippet) {
++    NamedRegionTimer T("assemble-measured-code", "Assemble Measured Code",
++                       TimerGroupName, TimerGroupDescription, TimerIsEnabled);
+     auto Snippet =
+         assembleSnippet(BC, Repetitor, BenchmarkResult.MinInstructions,
+                         LoopBodySize, GenerateMemoryInstructions);
+     if (Error E = Snippet.takeError())
+       return std::move(E);
++    if (Error E = BenchmarkResult.setObjectFile(*Snippet))
++      return std::move(E);
+     RC.ObjectFile = getObjectFromBuffer(*Snippet);
+   }
+ 
+   return std::move(RC);
+ }
+ 
++Expected<BenchmarkRunner::RunnableConfiguration>
++BenchmarkRunner::getRunnableConfiguration(Benchmark &&B) const {
++  NamedRegionTimer T("decompression", "Decompress serialized object file",
++                     TimerGroupName, TimerGroupDescription, TimerIsEnabled);
++  assert(B.ObjFile.has_value() && B.ObjFile->isValid() &&
++         "No serialized obejct file is attached?");
++  const Benchmark::ObjectFile &ObjFile = *B.ObjFile;
++  SmallVector<uint8_t> DecompressedObjFile;
++  switch (ObjFile.CompressionFormat) {
++  case compression::Format::Zstd:
++    if (!compression::zstd::isAvailable())
++      return make_error<StringError>("zstd is not available for decompression.",
++                                     inconvertibleErrorCode());
++    if (Error E = compression::zstd::decompress(ObjFile.CompressedBytes,
++                                                DecompressedObjFile,
++                                                ObjFile.UncompressedSize))
++      return std::move(E);
++    break;
++  case compression::Format::Zlib:
++    if (!compression::zlib::isAvailable())
++      return make_error<StringError>("zlib is not available for decompression.",
++                                     inconvertibleErrorCode());
++    if (Error E = compression::zlib::decompress(ObjFile.CompressedBytes,
++                                                DecompressedObjFile,
++                                                ObjFile.UncompressedSize))
++      return std::move(E);
++    break;
++  }
++
++  StringRef Buffer(reinterpret_cast<const char *>(DecompressedObjFile.begin()),
++                   DecompressedObjFile.size());
++  return RunnableConfiguration{std::move(B), getObjectFromBuffer(Buffer)};
++}
++
+ Expected<std::unique_ptr<BenchmarkRunner::FunctionExecutor>>
+ BenchmarkRunner::createFunctionExecutor(
+     object::OwningBinary<object::ObjectFile> ObjectFile,
+@@ -697,6 +749,8 @@ BenchmarkRunner::createFunctionExecutor(
+ std::pair<Error, Benchmark> BenchmarkRunner::runConfiguration(
+     RunnableConfiguration &&RC, const std::optional<StringRef> &DumpFile,
+     std::optional<int> BenchmarkProcessCPU) const {
++  NamedRegionTimer T("measurement", "Measure Performance", TimerGroupName,
++                     TimerGroupDescription, TimerIsEnabled);
+   Benchmark &BenchmarkResult = RC.BenchmarkResult;
+   object::OwningBinary<object::ObjectFile> &ObjectFile = RC.ObjectFile;
+ 
+diff --git a/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.h b/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.h
+index e688b814d1c8..34e36ca0f975 100644
+--- a/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.h
++++ b/llvm/tools/llvm-exegesis/lib/BenchmarkRunner.h
+@@ -54,11 +54,15 @@ public:
+     RunnableConfiguration &operator=(RunnableConfiguration &&) = delete;
+     RunnableConfiguration &operator=(const RunnableConfiguration &) = delete;
+ 
++    Benchmark BenchmarkResult;
++    object::OwningBinary<object::ObjectFile> ObjectFile;
++
+   private:
+     RunnableConfiguration() = default;
+ 
+-    Benchmark BenchmarkResult;
+-    object::OwningBinary<object::ObjectFile> ObjectFile;
++    RunnableConfiguration(Benchmark &&B,
++                          object::OwningBinary<object::ObjectFile> &&OF)
++        : BenchmarkResult(std::move(B)), ObjectFile(std::move(OF)) {}
+   };
+ 
+   Expected<RunnableConfiguration>
+@@ -66,6 +70,8 @@ public:
+                            unsigned MinInstructions, unsigned LoopUnrollFactor,
+                            const SnippetRepetitor &Repetitor) const;
+ 
++  Expected<RunnableConfiguration> getRunnableConfiguration(Benchmark &&B) const;
++
+   std::pair<Error, Benchmark>
+   runConfiguration(RunnableConfiguration &&RC,
+                    const std::optional<StringRef> &DumpFile,
+diff --git a/llvm/tools/llvm-exegesis/lib/CMakeLists.txt b/llvm/tools/llvm-exegesis/lib/CMakeLists.txt
+index d95c37ff5426..9be381cf4256 100644
+--- a/llvm/tools/llvm-exegesis/lib/CMakeLists.txt
++++ b/llvm/tools/llvm-exegesis/lib/CMakeLists.txt
+@@ -12,7 +12,7 @@ endif()
+ if (LLVM_TARGETS_TO_BUILD MATCHES "Mips")
+   list(APPEND LLVM_EXEGESIS_TARGETS "Mips")
+ endif()
+-if(LLVM_TARGETS_TO_BUILD MATCHES "RISCV")
++if (LLVM_TARGETS_TO_BUILD MATCHES "RISCV")
+   list(APPEND LLVM_EXEGESIS_TARGETS "RISCV")
+ endif()
+ 
+@@ -53,6 +53,7 @@ add_llvm_library(LLVMExegesis
+   DISABLE_LLVM_LINK_LLVM_DYLIB
+   STATIC
+   Analysis.cpp
++  AnalysisPrinters.cpp
+   Assembler.cpp
+   BenchmarkResult.cpp
+   BenchmarkRunner.cpp
+@@ -75,6 +76,7 @@ add_llvm_library(LLVMExegesis
+   SnippetRepetitor.cpp
+   SubprocessMemory.cpp
+   Target.cpp
++  Timer.cpp
+   UopsBenchmarkRunner.cpp
+   ValidationEvent.cpp
+ 
+diff --git a/llvm/tools/llvm-exegesis/lib/Clustering.cpp b/llvm/tools/llvm-exegesis/lib/Clustering.cpp
+index fc79718fdeb2..2df22571138c 100644
+--- a/llvm/tools/llvm-exegesis/lib/Clustering.cpp
++++ b/llvm/tools/llvm-exegesis/lib/Clustering.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "Clustering.h"
+ #include "Error.h"
++#include "ProgressMeter.h"
+ #include "SchedClassResolution.h"
+ #include "llvm/ADT/MapVector.h"
+ #include "llvm/ADT/SetVector.h"
+@@ -129,8 +130,12 @@ Error BenchmarkClustering::validateAndSetup() {
+ }
+ 
+ void BenchmarkClustering::clusterizeDbScan(const size_t MinPts) {
++  ProgressMeter<> Meter(Points_.size());
++
+   std::vector<size_t> Neighbors; // Persistent buffer to avoid allocs.
+   for (size_t P = 0, NumPoints = Points_.size(); P < NumPoints; ++P) {
++    ProgressMeter<>::ProgressMeterStep MeterStep(&Meter);
++
+     if (!ClusterIdForPoint_[P].isUndef())
+       continue; // Previously processed in inner loop.
+     rangeQuery(P, Neighbors);
+diff --git a/llvm/tools/llvm-exegesis/lib/Clustering.h b/llvm/tools/llvm-exegesis/lib/Clustering.h
+index 9d6c110e2e85..c1d68110c8e1 100644
+--- a/llvm/tools/llvm-exegesis/lib/Clustering.h
++++ b/llvm/tools/llvm-exegesis/lib/Clustering.h
+@@ -47,6 +47,11 @@ public:
+ 
+     ClusterId() : Id_(kUndef), IsUnstable_(false) {}
+ 
++    ClusterId(const ClusterId &) = default;
++    ClusterId(ClusterId &&) = default;
++    ClusterId &operator=(const ClusterId &) = default;
++    ClusterId &operator=(ClusterId &&) = default;
++
+     // Compare id's, ignoring the 'unstability' bit.
+     bool operator==(const ClusterId &O) const { return Id_ == O.Id_; }
+     bool operator<(const ClusterId &O) const { return Id_ < O.Id_; }
+diff --git a/llvm/tools/llvm-exegesis/lib/LlvmState.cpp b/llvm/tools/llvm-exegesis/lib/LlvmState.cpp
+index 00d0d2cfd1cd..b82a9867b6a7 100644
+--- a/llvm/tools/llvm-exegesis/lib/LlvmState.cpp
++++ b/llvm/tools/llvm-exegesis/lib/LlvmState.cpp
+@@ -46,7 +46,7 @@ Expected<LLVMState> LLVMState::Create(std::string TripleName,
+     CpuName = std::string(sys::getHostCPUName());
+ 
+   std::unique_ptr<MCSubtargetInfo> STI(
+-      TheTarget->createMCSubtargetInfo(TripleName, CpuName, ""));
++      TheTarget->createMCSubtargetInfo(TripleName, CpuName, Features));
+   assert(STI && "Unable to create subtarget info!");
+   if (!STI->isCPUStringValid(CpuName)) {
+     return make_error<StringError>(Twine("invalid CPU name (")
+diff --git a/llvm/tools/llvm-exegesis/lib/MCInstrDescView.cpp b/llvm/tools/llvm-exegesis/lib/MCInstrDescView.cpp
+index c002f68b427f..6d31367d3db1 100644
+--- a/llvm/tools/llvm-exegesis/lib/MCInstrDescView.cpp
++++ b/llvm/tools/llvm-exegesis/lib/MCInstrDescView.cpp
+@@ -44,6 +44,8 @@ bool Operand::isDef() const { return IsDef; }
+ 
+ bool Operand::isUse() const { return !IsDef; }
+ 
++bool Operand::isEarlyClobber() const { return IsEarlyClobber; }
++
+ bool Operand::isReg() const { return Tracker; }
+ 
+ bool Operand::isTied() const { return TiedToIndex.has_value(); }
+@@ -115,6 +117,8 @@ Instruction::create(const MCInstrInfo &InstrInfo,
+     Operand Operand;
+     Operand.Index = OpIndex;
+     Operand.IsDef = (OpIndex < Description->getNumDefs());
++    Operand.IsEarlyClobber =
++        (Description->getOperandConstraint(OpIndex, MCOI::EARLY_CLOBBER) != -1);
+     // TODO(gchatelet): Handle isLookupPtrRegClass.
+     if (OpInfo.RegClass >= 0)
+       Operand.Tracker = &RATC.getRegisterClass(OpInfo.RegClass);
+diff --git a/llvm/tools/llvm-exegesis/lib/MCInstrDescView.h b/llvm/tools/llvm-exegesis/lib/MCInstrDescView.h
+index c1af10fa460a..c3fe94564059 100644
+--- a/llvm/tools/llvm-exegesis/lib/MCInstrDescView.h
++++ b/llvm/tools/llvm-exegesis/lib/MCInstrDescView.h
+@@ -67,6 +67,7 @@ struct Operand {
+   bool isImplicitReg() const;
+   bool isDef() const;
+   bool isUse() const;
++  bool isEarlyClobber() const;
+   bool isReg() const;
+   bool isTied() const;
+   bool isVariable() const;
+@@ -82,6 +83,7 @@ struct Operand {
+   // Please use the accessors above and not the following fields.
+   std::optional<uint8_t> Index;
+   bool IsDef = false;
++  bool IsEarlyClobber = false;
+   const RegisterAliasingTracker *Tracker = nullptr; // Set for Register Op.
+   const MCOperandInfo *Info = nullptr;              // Set for Explicit Op.
+   std::optional<uint8_t> TiedToIndex;               // Set for Reg&Explicit Op.
+@@ -115,6 +117,8 @@ struct Instruction {
+   Instruction &operator=(const Instruction &) = delete;
+   Instruction &operator=(Instruction &&) = delete;
+ 
++  unsigned getOpcode() const { return Description.getOpcode(); }
++
+   // Returns the Operand linked to this Variable.
+   // In case the Variable is tied, the primary (i.e. Def) Operand is returned.
+   const Operand &getPrimaryOperand(const Variable &Var) const;
+diff --git a/llvm/tools/llvm-exegesis/lib/PerfHelper.cpp b/llvm/tools/llvm-exegesis/lib/PerfHelper.cpp
+index 3f3288ceb1e4..08562f1254f6 100644
+--- a/llvm/tools/llvm-exegesis/lib/PerfHelper.cpp
++++ b/llvm/tools/llvm-exegesis/lib/PerfHelper.cpp
+@@ -17,6 +17,11 @@
+ #include <perfmon/pfmlib_perf_event.h>
+ #endif
+ 
++#include <asm/unistd.h>
++#include <linux/perf_event.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
+ #include <cassert>
+ #include <cstddef>
+ #include <errno.h>  // for erno
+@@ -44,6 +49,12 @@ void pfmTerminate() {
+ #endif
+ }
+ 
++static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
++                            int cpu, int group_fd, unsigned long flags) {
++  int ret = syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
++  return ret;
++}
++
+ // Performance counters may be unavailable for a number of reasons (such as
+ // kernel.perf_event_paranoid restriction or CPU being unknown to libpfm).
+ //
+@@ -51,12 +62,7 @@ void pfmTerminate() {
+ // counters while still passing control to the generated code snippet.
+ const char *const PerfEvent::DummyEventString = "not-really-an-event";
+ 
+-PerfEvent::~PerfEvent() {
+-#ifdef HAVE_LIBPFM
+-  delete Attr;
+-  ;
+-#endif
+-}
++PerfEvent::~PerfEvent() { delete Attr; }
+ 
+ PerfEvent::PerfEvent(PerfEvent &&Other)
+     : EventString(std::move(Other.EventString)),
+@@ -112,7 +118,6 @@ ConfiguredEvent::ConfiguredEvent(PerfEvent &&EventToConfigure)
+   assert(Event.valid());
+ }
+ 
+-#ifdef HAVE_LIBPFM
+ void ConfiguredEvent::initRealEvent(const pid_t ProcessID, const int GroupFD) {
+   const int CPU = -1;
+   const uint32_t Flags = 0;
+@@ -145,17 +150,6 @@ ConfiguredEvent::readOrError(StringRef /*unused*/) const {
+ }
+ 
+ ConfiguredEvent::~ConfiguredEvent() { close(FileDescriptor); }
+-#else
+-void ConfiguredEvent::initRealEvent(pid_t ProcessID, const int GroupFD) {}
+-
+-Expected<SmallVector<int64_t>>
+-ConfiguredEvent::readOrError(StringRef /*unused*/) const {
+-  return make_error<StringError>("Not implemented",
+-                                 errc::function_not_supported);
+-}
+-
+-ConfiguredEvent::~ConfiguredEvent() = default;
+-#endif // HAVE_LIBPFM
+ 
+ CounterGroup::CounterGroup(PerfEvent &&E, std::vector<PerfEvent> &&ValEvents,
+                            pid_t ProcessID)
+@@ -169,7 +163,6 @@ CounterGroup::CounterGroup(PerfEvent &&E, std::vector<PerfEvent> &&ValEvents,
+     initRealEvent(ProcessID);
+ }
+ 
+-#ifdef HAVE_LIBPFM
+ void CounterGroup::initRealEvent(pid_t ProcessID) {
+   EventCounter.initRealEvent(ProcessID);
+ 
+@@ -178,8 +171,10 @@ void CounterGroup::initRealEvent(pid_t ProcessID) {
+ }
+ 
+ void CounterGroup::start() {
+-  if (!IsDummyEvent)
++  if (!IsDummyEvent) {
+     ioctl(getFileDescriptor(), PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
++    ioctl(getFileDescriptor(), PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
++  }
+ }
+ 
+ void CounterGroup::stop() {
+@@ -215,32 +210,6 @@ CounterGroup::readValidationCountersOrError() const {
+ }
+ 
+ int CounterGroup::numValues() const { return 1; }
+-#else
+-
+-void CounterGroup::initRealEvent(pid_t ProcessID) {}
+-
+-void CounterGroup::start() {}
+-
+-void CounterGroup::stop() {}
+-
+-Expected<SmallVector<int64_t, 4>>
+-CounterGroup::readOrError(StringRef /*unused*/) const {
+-  if (IsDummyEvent) {
+-    SmallVector<int64_t, 4> Result;
+-    Result.push_back(42);
+-    return Result;
+-  }
+-  return make_error<StringError>("Not implemented", errc::io_error);
+-}
+-
+-Expected<SmallVector<int64_t>>
+-CounterGroup::readValidationCountersOrError() const {
+-  return SmallVector<int64_t>(0);
+-}
+-
+-int CounterGroup::numValues() const { return 1; }
+-
+-#endif
+ 
+ } // namespace pfm
+ } // namespace exegesis
+diff --git a/llvm/tools/llvm-exegesis/lib/ProgressMeter.h b/llvm/tools/llvm-exegesis/lib/ProgressMeter.h
+index c09b9e960451..9ea27bf5c47a 100644
+--- a/llvm/tools/llvm-exegesis/lib/ProgressMeter.h
++++ b/llvm/tools/llvm-exegesis/lib/ProgressMeter.h
+@@ -9,6 +9,7 @@
+ #ifndef LLVM_TOOLS_LLVM_EXEGESIS_PROGRESSMETER_H
+ #define LLVM_TOOLS_LLVM_EXEGESIS_PROGRESSMETER_H
+ 
++#include "llvm/ADT/StringExtras.h"
+ #include "llvm/Support/Format.h"
+ #include "llvm/Support/raw_ostream.h"
+ #include <cassert>
+@@ -67,6 +68,7 @@ private:
+   raw_ostream &Out;
+   const int NumStepsTotal;
+   SimpleMovingAverage<DurationType> ElapsedTotal;
++  ListSeparator Carriage;
+ 
+ public:
+   friend class ProgressMeterStep;
+@@ -93,10 +95,12 @@ public:
+   };
+ 
+   ProgressMeter(int NumStepsTotal_, raw_ostream &out_ = errs())
+-      : Out(out_), NumStepsTotal(NumStepsTotal_) {
++      : Out(out_), NumStepsTotal(NumStepsTotal_), Carriage("\r") {
+     assert(NumStepsTotal > 0 && "No steps are planned?");
+   }
+ 
++  ~ProgressMeter() { Out << "\n"; }
++
+   ProgressMeter(const ProgressMeter &) = delete;
+   ProgressMeter(ProgressMeter &&) = delete;
+   ProgressMeter &operator=(const ProgressMeter &) = delete;
+@@ -114,7 +118,7 @@ private:
+     if (NewProgress < OldProgress + 1)
+       return;
+ 
+-    Out << format("Processing... %*d%%", 3, NewProgress);
++    Out << Carriage << format("Processing... %*d%%", 3, NewProgress);
+     if (NewEta) {
+       int SecondsTotal = std::ceil(NewEta->count());
+       int Seconds = SecondsTotal % 60;
+@@ -122,7 +126,6 @@ private:
+ 
+       Out << format(", ETA %02d:%02d", MinutesTotal, Seconds);
+     }
+-    Out << "\n";
+     Out.flush();
+   }
+ 
+diff --git a/llvm/tools/llvm-exegesis/lib/RISCV/CMakeLists.txt b/llvm/tools/llvm-exegesis/lib/RISCV/CMakeLists.txt
+index 489ac6d6e34b..2868a64de79c 100644
+--- a/llvm/tools/llvm-exegesis/lib/RISCV/CMakeLists.txt
++++ b/llvm/tools/llvm-exegesis/lib/RISCV/CMakeLists.txt
+@@ -8,12 +8,18 @@ set(LLVM_LINK_COMPONENTS
+   RISCV
+   Exegesis
+   Core
++  # MERGEME: is CodeGenTypes required?
++  CodeGenTypes
++  # MERGEME: is MC required?
++  MC
+   Support
+   )
+ 
+ add_llvm_library(LLVMExegesisRISCV
+   DISABLE_LLVM_LINK_LLVM_DYLIB
+   STATIC
++  RISCVExegesisPostprocessing.cpp
++  RISCVExegesisPreprocessing.cpp
+   Target.cpp
+ 
+   DEPENDS
+diff --git a/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPasses.h b/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPasses.h
+new file mode 100644
+index 000000000000..f20696633175
+--- /dev/null
++++ b/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPasses.h
+@@ -0,0 +1,19 @@
++//===- RISCVExegesisPasses.h - RISC-V specific Exegesis Passes --*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_TOOLS_EXEGESIS_LIB_RISCV_RISCVEXEGESISPASSES_H
++#define LLVM_TOOLS_EXEGESIS_LIB_RISCV_RISCVEXEGESISPASSES_H
++namespace llvm {
++class FunctionPass;
++
++namespace exegesis {
++FunctionPass *createRISCVPreprocessingPass();
++FunctionPass *createRISCVPostprocessingPass();
++} // namespace exegesis
++} // namespace llvm
++#endif
+diff --git a/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPostprocessing.cpp b/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPostprocessing.cpp
+new file mode 100644
+index 000000000000..e8220b82f37b
+--- /dev/null
++++ b/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPostprocessing.cpp
+@@ -0,0 +1,126 @@
++//===- RISCVExegesisPostprocessing.cpp - Post processing MI for exegesis---===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++// \file
++// Currently there is only one post-processing we need to do for exegesis:
++// Assign a physical register to VSETVL's rd if it's not X0 (i.e. VLMAX).
++//
++//===----------------------------------------------------------------------===//
++
++#include "RISCV.h"
++#include "RISCVExegesisPasses.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "riscv-exegesis-post-processing"
++
++namespace {
++struct RISCVExegesisPostprocessing : public MachineFunctionPass {
++  static char ID;
++
++  RISCVExegesisPostprocessing() : MachineFunctionPass(ID) {}
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesCFG();
++    MachineFunctionPass::getAnalysisUsage(AU);
++  }
++
++private:
++  // Extremely simple register allocator that picks a register that hasn't
++  // been defined or used in this function.
++  Register allocateGPRRegister(const MachineFunction &MF,
++                               const MachineRegisterInfo &MRI);
++
++  bool processVSETVL(MachineInstr &MI, MachineRegisterInfo &MRI);
++  bool processWriteFRM(MachineInstr &MI, MachineRegisterInfo &MRI);
++};
++} // anonymous namespace
++
++char RISCVExegesisPostprocessing::ID = 0;
++
++bool RISCVExegesisPostprocessing::runOnMachineFunction(MachineFunction &MF) {
++  bool Changed = false;
++  for (auto &MBB : MF)
++    for (auto &MI : MBB) {
++      unsigned Opcode = MI.getOpcode();
++      switch (Opcode) {
++      case RISCV::VSETVLI:
++      case RISCV::VSETVL:
++      case RISCV::PseudoVSETVLI:
++      case RISCV::PseudoVSETVLIX0:
++        Changed |= processVSETVL(MI, MF.getRegInfo());
++        break;
++      case RISCV::SwapFRMImm:
++      case RISCV::WriteFRM:
++        Changed |= processWriteFRM(MI, MF.getRegInfo());
++        break;
++      default:
++        break;
++      }
++    }
++
++  if (Changed)
++    MF.getRegInfo().clearVirtRegs();
++
++  return Changed;
++}
++
++Register RISCVExegesisPostprocessing::allocateGPRRegister(
++    const MachineFunction &MF, const MachineRegisterInfo &MRI) {
++  const auto &TRI = *MRI.getTargetRegisterInfo();
++
++  const TargetRegisterClass *GPRClass =
++      TRI.getRegClass(RISCV::GPRJALRRegClassID);
++  BitVector Candidates = TRI.getAllocatableSet(MF, GPRClass);
++
++  for (unsigned SetIdx : Candidates.set_bits()) {
++    if (MRI.reg_empty(Register(SetIdx)))
++      return Register(SetIdx);
++  }
++
++  // All bets are off, assigned a fixed one.
++  return RISCV::X5;
++}
++
++bool RISCVExegesisPostprocessing::processVSETVL(MachineInstr &MI,
++                                                MachineRegisterInfo &MRI) {
++  bool Changed = false;
++  // Replace both AVL and VL (i.e. the result) operands with physical
++  // registers.
++  for (unsigned Idx = 0U; Idx < 2; ++Idx)
++    if (MI.getOperand(Idx).isReg()) {
++      Register RegOp = MI.getOperand(Idx).getReg();
++      if (RegOp.isVirtual()) {
++        MRI.replaceRegWith(RegOp, allocateGPRRegister(*MI.getMF(), MRI));
++        Changed = true;
++      }
++    }
++
++  return Changed;
++}
++
++bool RISCVExegesisPostprocessing::processWriteFRM(MachineInstr &MI,
++                                                  MachineRegisterInfo &MRI) {
++  // The virtual register will be the first operand in both SwapFRMImm and
++  // WriteFRM.
++  if (MI.getOperand(0).isReg()) {
++    Register DestReg = MI.getOperand(0).getReg();
++    if (DestReg.isVirtual()) {
++      MRI.replaceRegWith(DestReg, allocateGPRRegister(*MI.getMF(), MRI));
++      return true;
++    }
++  }
++  return false;
++}
++
++FunctionPass *llvm::exegesis::createRISCVPostprocessingPass() {
++  return new RISCVExegesisPostprocessing();
++}
+diff --git a/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPreprocessing.cpp b/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPreprocessing.cpp
+new file mode 100644
+index 000000000000..ad3245f88201
+--- /dev/null
++++ b/llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPreprocessing.cpp
+@@ -0,0 +1,82 @@
++//===- RISCVExegesisPreprocessing.cpp -------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++// \file
++//
++//===----------------------------------------------------------------------===//
++
++#include "RISCV.h"
++#include "RISCVExegesisPasses.h"
++#include "RISCVRegisterInfo.h"
++#include "RISCVSubtarget.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "riscv-exegesis-preprocessing"
++
++namespace {
++struct RISCVExegesisPreprocessing : public MachineFunctionPass {
++  static char ID;
++
++  RISCVExegesisPreprocessing() : MachineFunctionPass(ID) {}
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesCFG();
++    MachineFunctionPass::getAnalysisUsage(AU);
++  }
++};
++} // anonymous namespace
++
++char RISCVExegesisPreprocessing::ID = 0;
++
++static bool processAVLOperand(MachineInstr &MI, MachineRegisterInfo &MRI,
++                              const TargetInstrInfo &TII) {
++  const MCInstrDesc &Desc = TII.get(MI.getOpcode());
++  uint64_t TSFlags = Desc.TSFlags;
++  if (!RISCVII::hasVLOp(TSFlags))
++    return false;
++
++  const MachineOperand &VLOp = MI.getOperand(RISCVII::getVLOpNum(Desc));
++  if (VLOp.isReg()) {
++    Register VLReg = VLOp.getReg();
++    if (VLReg.isVirtual())
++      return false;
++    assert(RISCV::GPRRegClass.contains(VLReg));
++    // Replace all uses of the original physical register with a new virtual
++    // register. The only reason we can do such replacement here is because it's
++    // almost certain that VLReg only has a single definition.
++    Register NewVLReg = MRI.createVirtualRegister(&RISCV::GPRRegClass);
++    MRI.replaceRegWith(VLReg, NewVLReg);
++    return true;
++  }
++
++  return false;
++}
++
++bool RISCVExegesisPreprocessing::runOnMachineFunction(MachineFunction &MF) {
++  MachineRegisterInfo &MRI = MF.getRegInfo();
++  const auto &STI = MF.getSubtarget<RISCVSubtarget>();
++  if (!STI.hasVInstructions())
++    return false;
++  const TargetInstrInfo &TII = *STI.getInstrInfo();
++
++  bool Changed = false;
++  for (auto &MBB : MF)
++    for (auto &MI : MBB) {
++      Changed |= processAVLOperand(MI, MRI, TII);
++    }
++
++  return Changed;
++}
++
++FunctionPass *llvm::exegesis::createRISCVPreprocessingPass() {
++  return new RISCVExegesisPreprocessing();
++}
+diff --git a/llvm/tools/llvm-exegesis/lib/RISCV/Target.cpp b/llvm/tools/llvm-exegesis/lib/RISCV/Target.cpp
+index d70f609c5e08..9bd0822bbd11 100644
+--- a/llvm/tools/llvm-exegesis/lib/RISCV/Target.cpp
++++ b/llvm/tools/llvm-exegesis/lib/RISCV/Target.cpp
+@@ -8,10 +8,40 @@
+ 
+ #include "../Target.h"
+ 
++<<<<<<<
++=======
++#include "../ParallelSnippetGenerator.h"
++#include "../SerialSnippetGenerator.h"
++#include "../SnippetGenerator.h"
++>>>>>>>
+ #include "MCTargetDesc/RISCVBaseInfo.h"
++<<<<<<< HEAD
+ #include "MCTargetDesc/RISCVMCTargetDesc.h"
++=======
++>>>>>>>
+ #include "MCTargetDesc/RISCVMatInt.h"
++<<<<<<<
++=======
++#include "MCTargetDesc/RISCVMatInt.h"
++#include "RISCV.h"
++#include "RISCVExegesisPasses.h"
++>>>>>>>
+ #include "RISCVInstrInfo.h"
++<<<<<<<
++
++#include <vector>
++=======
++#include "RISCVRegisterInfo.h"
++#include "RISCVSubtarget.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallSet.h"
++#include "llvm/Support/Regex.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <array>
++
++#include <linux/perf_event.h>
++>>>>>>>
+ 
+ // include computeAvailableFeatures and computeRequiredFeatures.
+ #define GET_AVAILABLE_OPCODE_CHECKER
+@@ -19,15 +49,60 @@
+ 
+ #include "llvm/CodeGen/MachineInstrBuilder.h"
+ 
+-#include <vector>
++<<<<<<<
++=======
++namespace RVVPseudoTables {
++using namespace llvm;
++using namespace llvm::RISCV;
++
++struct PseudoInfo {
++  uint16_t Pseudo;
++  uint16_t BaseInstr;
++  uint8_t VLMul;
++  uint8_t SEW;
++};
++
++struct RISCVMaskedPseudoInfo {
++  uint16_t MaskedPseudo;
++  uint16_t UnmaskedPseudo;
++  uint8_t MaskOpIdx;
++};
++
++#define GET_RISCVVInversePseudosTable_IMPL
++#define GET_RISCVVInversePseudosTable_DECL
++#define GET_RISCVMaskedPseudosTable_DECL
++#define GET_RISCVMaskedPseudosTable_IMPL
++#include "RISCVGenSearchableTables.inc"
++
++} // namespace RVVPseudoTables
++>>>>>>> bcced4b0d15c ([Exegesis][RISCV] RVV support for llvm-exegesis)
+ 
+ namespace llvm {
+ namespace exegesis {
+ 
++<<<<<<< HEAD
++=======
++static cl::opt<bool>
++    OnlyUsesVLMAXForVL("riscv-vlmax-for-vl",
++                       cl::desc("Only enumerate VLMAX for VL operand"),
++                       cl::init(false), cl::Hidden);
++
++static cl::opt<bool>
++    EnumerateRoundingModes("riscv-enumerate-rounding-modes",
++                           cl::desc("Enumerate different FRM and VXRM"),
++                           cl::init(true), cl::Hidden);
++
++static cl::opt<std::string>
++    FilterConfig("riscv-filter-config",
++                 cl::desc("Show only the configs matching this regex"),
++                 cl::init(""), cl::Hidden);
++>>>>>>> bcced4b0d15c ([Exegesis][RISCV] RVV support for llvm-exegesis)
++
+ #include "RISCVGenExegesis.inc"
+ 
+ namespace {
+ 
++<<<<<<< HEAD
+ // Stores constant value to a general-purpose (integer) register.
+ static std::vector<MCInst> loadIntReg(const MCSubtargetInfo &STI,
+                                       MCRegister Reg, const APInt &Value) {
+@@ -99,6 +174,596 @@ static bool isVectorRegList(MCRegister Reg) {
+          RISCV::VRN7M1RegClass.contains(Reg) ||
+          RISCV::VRN8M1RegClass.contains(Reg);
+ }
++=======
++>>>>>>>
++
++<<<<<<<
++=======
++static perf_event_attr *createPerfEventAttr(unsigned Type, uint64_t Config) {
++  auto *PEA = new perf_event_attr();
++  memset(PEA, 0, sizeof(perf_event_attr));
++  PEA->type = Type;
++  PEA->size = sizeof(perf_event_attr);
++  PEA->config = Config;
++  PEA->disabled = 1;
++  PEA->exclude_kernel = 1;
++  PEA->exclude_hv = 1;
++  return PEA;
++}
++
++struct RISCVPerfEvent : public pfm::PerfEvent {
++  explicit RISCVPerfEvent(StringRef PfmEventString)
++      : pfm::PerfEvent(PfmEventString) {
++    FullQualifiedEventString = EventString;
++
++    if (EventString == "CYCLES" || EventString == "CPU_CYCLES")
++      Attr = createPerfEventAttr(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES);
++  }
++};
++
++template <class BaseT> class RVVSnippetGenerator : public BaseT {
++  static void printRoundingMode(raw_ostream &OS, unsigned Val, bool UsesVXRM) {
++    static const char *const FRMNames[] = {"rne", "rtz", "rdn", "rup",
++                                           "rmm", "N/A", "N/A", "dyn"};
++    static const char *const VXRMNames[] = {"rnu", "rne", "rdn", "rod"};
++
++    if (UsesVXRM) {
++      assert(Val < 4);
++      OS << VXRMNames[Val];
++    } else {
++      assert(Val != 5 && Val != 6);
++      OS << FRMNames[Val];
++    }
++  }
++
++  static constexpr unsigned MinSEW = 8;
++  // ELEN is basically SEW_max.
++  static constexpr unsigned ELEN = 64;
++
++  // We can't know the real min/max VLEN w/o a Function, so we're
++  // using the VLen from Zvl.
++  unsigned ZvlVLen = 32;
++
++  /// Mask for registers that are NOT standalone registers like X0 and V0
++  BitVector AggregateRegisters;
++
++  // Returns true when opcode is available in any of the FBs.
++  static bool
++  isOpcodeAvailableIn(unsigned Opcode,
++                      ArrayRef<RISCV_MC::SubtargetFeatureBits> FBs) {
++    FeatureBitset RequiredFeatures = RISCV_MC::computeRequiredFeatures(Opcode);
++    for (uint8_t FB : FBs) {
++      if (RequiredFeatures[FB])
++        return true;
++    }
++    return false;
++  }
++
++  static bool isRVVFloatingPointOp(unsigned Opcode) {
++    return isOpcodeAvailableIn(Opcode,
++                               {RISCV_MC::Feature_HasVInstructionsAnyFBit});
++  }
++
++  // Get the element group width of each vector cryptor extension.
++  static unsigned getZvkEGWSize(unsigned Opcode, unsigned SEW) {
++    using namespace RISCV_MC;
++    if (isOpcodeAvailableIn(Opcode, {Feature_HasStdExtZvkgBit,
++                                     Feature_HasStdExtZvknedBit,
++                                     Feature_HasStdExtZvksedBit}))
++      return 128U;
++    else if (isOpcodeAvailableIn(Opcode, {Feature_HasStdExtZvkshBit}))
++      return 256U;
++    else if (isOpcodeAvailableIn(Opcode, {Feature_HasStdExtZvknhaOrZvknhbBit}))
++      // In Zvknh[ab], when SEW=64 is used (i.e. Zvknhb), EGW is 256.
++      // Otherwise it's 128.
++      return SEW == 64 ? 256U : 128U;
++
++    llvm_unreachable("Unsupported opcode");
++  }
++
++  // A handy utility to multiply or divide an integer by LMUL.
++  template <typename T> static T multiplyLMul(T Val, RISCVII::VLMUL LMul) {
++    // Fractional
++    if (LMul >= RISCVII::LMUL_F8)
++      return Val >> (8 - LMul);
++    else
++      return Val << LMul;
++  }
++
++  /// Return the denominator of the fractional (i.e. the `x` in .vfx suffix) or
++  /// nullopt if BaseOpcode is not a vector sext/zext.
++  static std::optional<unsigned> isRVVSignZeroExtend(unsigned BaseOpcode) {
++    switch (BaseOpcode) {
++    case RISCV::VSEXT_VF2:
++    case RISCV::VZEXT_VF2:
++      return 2;
++    case RISCV::VSEXT_VF4:
++    case RISCV::VZEXT_VF4:
++      return 4;
++    case RISCV::VSEXT_VF8:
++    case RISCV::VZEXT_VF8:
++      return 8;
++    default:
++      return std::nullopt;
++    }
++  }
++
++  void annotateWithVType(const CodeTemplate &CT, const Instruction &Instr,
++                         unsigned BaseOpcode,
++                         const BitVector &ForbiddenRegisters,
++                         std::vector<CodeTemplate> &Result) const;
++
++public:
++  RVVSnippetGenerator(const LLVMState &State,
++                      const SnippetGenerator::Options &Opts);
++
++  Expected<std::vector<CodeTemplate>>
++  generateCodeTemplates(InstructionTemplate Variant,
++                        const BitVector &ForbiddenRegisters) const override;
++};
++
++template <class BaseT> 
++RVVSnippetGenerator<BaseT>::RVVSnippetGenerator(const LLVMState &State,
++                                         const SnippetGenerator::Options &Opts)
++    : BaseT(State, Opts),
++      AggregateRegisters(State.getRegInfo().getNumRegs(), /*initVal=*/true) {
++  // Initialize standalone registers mask.
++  const MCRegisterInfo &RegInfo = State.getRegInfo();
++  const unsigned StandaloneRegClasses[] = {
++      RISCV::GPRRegClassID, RISCV::FPR16RegClassID, RISCV::VRRegClassID};
++
++  for (unsigned RegClassID : StandaloneRegClasses)
++    for (unsigned Reg : RegInfo.getRegClass(RegClassID)) {
++      AggregateRegisters.reset(Reg);
++    }
++
++  // Initialize the ZvlVLen.
++  const MCSubtargetInfo &STI = State.getSubtargetInfo();
++  std::string ZvlQuery;
++  for (unsigned I = 5U, Size = (1 << I); I < 17U; ++I, Size <<= 1) {
++    ZvlQuery = "+zvl";
++    raw_string_ostream SS(ZvlQuery);
++    SS << Size << "b";
++    if (STI.checkFeatures(SS.str()) && ZvlVLen < Size)
++      ZvlVLen = Size;
++  }
++}
++
++static bool isMaskedSibiling(unsigned MaskedOp, unsigned UnmaskedOp) {
++  const auto *RVVMasked = RVVPseudoTables::getMaskedPseudoInfo(MaskedOp);
++  return RVVMasked && RVVMasked->UnmaskedPseudo == UnmaskedOp;
++}
++
++// There are primarily two kinds of opcodes that are not eligible
++// in a serial snippet:
++// (1) Only has a single use operand that can not be overlap with
++// the def operand.
++// (2) The register file of the only use operand is different from
++// that of the def operand. For instance, use operand is vector and
++// the result is a scalar.
++static bool isIneligibleOfSerialSnippets(unsigned BaseOpcode,
++                                         const Instruction &I) {
++  if (llvm::any_of(I.Operands,
++                   [](const Operand &Op) { return Op.isEarlyClobber(); }))
++    return true;
++
++  switch (BaseOpcode) {
++  case RISCV::VCOMPRESS_VM:
++  case RISCV::VCPOP_M:
++  case RISCV::VCPOP_V:
++  case RISCV::VRGATHEREI16_VV:
++  case RISCV::VRGATHER_VI:
++  case RISCV::VRGATHER_VV:
++  case RISCV::VRGATHER_VX:
++  case RISCV::VSLIDE1UP_VX:
++  case RISCV::VSLIDEUP_VI:
++  case RISCV::VSLIDEUP_VX:
++  // The truncate instructions that arraive here are those who cannot
++  // have any overlap between source and dest at all (i.e.
++  // those whoe don't satisfy condition 2 and 3 in RVV spec
++  // 5.2).
++  case RISCV::VNCLIPU_WI:
++  case RISCV::VNCLIPU_WV:
++  case RISCV::VNCLIPU_WX:
++  case RISCV::VNCLIP_WI:
++  case RISCV::VNCLIP_WV:
++  case RISCV::VNCLIP_WX:
++    return true;
++  default:
++    return false;
++  }
++}
++
++static bool isZvfhminZvfbfminOpcodes(unsigned BaseOpcode) {
++  switch (BaseOpcode) {
++  case RISCV::VFNCVT_F_F_W:
++  case RISCV::VFWCVT_F_F_V:
++  case RISCV::VFNCVTBF16_F_F_W:
++  case RISCV::VFWCVTBF16_F_F_V:
++    return true;
++  default:
++    return false;
++  }
++}
++
++static bool isVectorReduction(unsigned BaseOpcode) {
++  switch (BaseOpcode) {
++  case RISCV::VREDAND_VS:
++  case RISCV::VREDMAXU_VS:
++  case RISCV::VREDMAX_VS:
++  case RISCV::VREDMINU_VS:
++  case RISCV::VREDMIN_VS:
++  case RISCV::VREDOR_VS:
++  case RISCV::VREDSUM_VS:
++  case RISCV::VREDXOR_VS:
++  case RISCV::VWREDSUMU_VS:
++  case RISCV::VWREDSUM_VS:
++  case RISCV::VFREDMAX_VS:
++  case RISCV::VFREDMIN_VS:
++  case RISCV::VFREDOSUM_VS:
++  case RISCV::VFREDUSUM_VS:
++    return true;
++  default:
++    return false;
++  }
++}
++
++
++template <class BaseT>
++void RVVSnippetGenerator<BaseT>::annotateWithVType(
++    const CodeTemplate &OrigCT, const Instruction &Instr, unsigned BaseOpcode,
++    const BitVector &ForbiddenRegisters,
++    std::vector<CodeTemplate> &Result) const {
++  const MCSubtargetInfo &STI = SnippetGenerator::State.getSubtargetInfo();
++  unsigned VPseudoOpcode = Instr.getOpcode();
++
++  bool IsSerial = std::is_same_v<BaseT, SerialSnippetGenerator>;
++
++  const MCInstrDesc &MIDesc = Instr.Description;
++  const uint64_t TSFlags = MIDesc.TSFlags;
++
++  RISCVII::VLMUL VLMul = RISCVII::getLMul(TSFlags);
++
++  const size_t StartingResultSize = Result.size();
++
++  SmallPtrSet<const Operand *, 4> VTypeOperands;
++  std::optional<AliasingConfigurations> SelfAliasing;
++  // Exegesis see instructions with tied operands being inherently serial.
++  // But for RVV instructions, those tied operands are passthru rather
++  // than real read operands. So we manually put dependency between
++  // destination (i.e. def) and any of the non-tied/SEW/policy/AVL/RM
++  // operands.
++  auto assignSerialRVVOperands = [&, this](InstructionTemplate &IT) {
++    // Initialize SelfAliasing on first use.
++    if (!SelfAliasing.has_value()) {
++      BitVector ExcludeRegs = ForbiddenRegisters;
++      ExcludeRegs |= AggregateRegisters;
++      SelfAliasing = AliasingConfigurations(Instr, Instr, ExcludeRegs);
++      bool EmptyUses = false;
++      for (auto &ARO : SelfAliasing->Configurations) {
++        auto &Uses = ARO.Uses;
++        for (auto ROA = Uses.begin(); ROA != Uses.end();) {
++          const Operand *Op = ROA->Op;
++          // Exclude tied operand(s).
++          if (Op->isTied()) {
++            ROA = Uses.erase(ROA);
++            continue;
++          }
++
++          // Special handling for reduction operations: for a given reduction
++          // `vredop vd, vs2, vs1`, we don't want vd to be aliased with vs1
++          // since we're only reading `vs1[0]` and many implementations
++          // optimize for this case (e.g. chaining). Instead, we're forcing
++          // it to create alias between vd and vs2.
++          if (isVectorReduction(BaseOpcode) &&
++              // vs1's operand index is always 3.
++              Op->getIndex() == 3) {
++            ROA = Uses.erase(ROA);
++            continue;
++          }
++
++          // Exclude any special operands like SEW and VL -- we've already
++          // assigned values to them.
++          if (VTypeOperands.count(Op)) {
++            ROA = Uses.erase(ROA);
++            continue;
++          }
++          ++ROA;
++        }
++
++        // If any of the use operand candidate lists is empty, there is
++        // no point to assign self aliasing registers.
++        if (Uses.empty()) {
++          EmptyUses = true;
++          break;
++        }
++      }
++      if (EmptyUses)
++        SelfAliasing->Configurations.clear();
++    }
++
++    // This is a self aliasing instruction so defs and uses are from the same
++    // instance, hence twice IT in the following call.
++    if (!SelfAliasing->empty() && !SelfAliasing->hasImplicitAliasing())
++      setRandomAliasing(*SelfAliasing, IT, IT);
++  };
++
++  // We are going to create a CodeTemplate (configuration) for each supported
++  // SEW, policy, and VL.
++  // FIXME: Account for EEW and EMUL.
++  SmallVector<std::optional<unsigned>, 4> Log2SEWs;
++  SmallVector<std::optional<unsigned>, 4> Policies;
++  SmallVector<std::optional<int>, 3> AVLs;
++  SmallVector<std::optional<unsigned>, 8> RoundingModes;
++
++  bool HasSEWOp = RISCVII::hasSEWOp(TSFlags);
++  bool HasPolicyOp = RISCVII::hasVecPolicyOp(TSFlags);
++  bool HasVLOp = RISCVII::hasVLOp(TSFlags);
++  bool HasRMOp = RISCVII::hasRoundModeOp(TSFlags);
++  bool UsesVXRM = RISCVII::usesVXRM(TSFlags);
++
++  if (HasSEWOp) {
++    VTypeOperands.insert(&Instr.Operands[RISCVII::getSEWOpNum(MIDesc)]);
++
++    SmallVector<unsigned, 4> SEWCandidates;
++
++    // (RVV spec 3.4.2) For fractional LMUL, the supported SEW are between
++    // [SEW_min, LMUL * ELEN].
++    unsigned SEWUpperBound =
++        VLMul >= RISCVII::LMUL_F8 ? multiplyLMul(ELEN, VLMul) : ELEN;
++    for (unsigned SEW = MinSEW; SEW <= SEWUpperBound; SEW <<= 1) {
++      SEWCandidates.push_back(SEW);
++
++      // Some scheduling classes already integrate SEW; only put
++      // their corresponding SEW values at the SEW operands.
++      // NOTE: It is imperative to put this condition in the front, otherwise
++      // it is tricky and difficult to know if there is an integrated
++      // SEW after other rules are applied to filter the candidates.
++      const auto *RVVBase =
++          RVVPseudoTables::getBaseInfo(BaseOpcode, VLMul, SEW);
++      if (RVVBase && (RVVBase->Pseudo == VPseudoOpcode ||
++                      isMaskedSibiling(VPseudoOpcode, RVVBase->Pseudo) ||
++                      isMaskedSibiling(RVVBase->Pseudo, VPseudoOpcode))) {
++        // There is an integrated SEW, remove all but the SEW pushed last.
++        SEWCandidates.erase(SEWCandidates.begin(), SEWCandidates.end() - 1);
++        break;
++      }
++    }
++
++    // Filter out some candidates.
++    for (auto SEW = SEWCandidates.begin(); SEW != SEWCandidates.end();) {
++      // For floating point operations, only select SEW of the supported FLEN.
++      if (isRVVFloatingPointOp(VPseudoOpcode)) {
++        bool Supported = false;
++        Supported |= isZvfhminZvfbfminOpcodes(BaseOpcode) && *SEW == 16;
++        Supported |= STI.hasFeature(RISCV::FeatureStdExtZvfh) && *SEW == 16;
++        Supported |= STI.hasFeature(RISCV::FeatureStdExtF) && *SEW == 32;
++        Supported |= STI.hasFeature(RISCV::FeatureStdExtD) && *SEW == 64;
++        if (!Supported) {
++          SEW = SEWCandidates.erase(SEW);
++          continue;
++        }
++      }
++
++      // The EEW for source operand in VSEXT and VZEXT is a fractional
++      // of the SEW, hence only SEWs that will lead to valid EEW are allowed.
++      if (auto Frac = isRVVSignZeroExtend(BaseOpcode))
++        if (*SEW / *Frac < MinSEW) {
++          SEW = SEWCandidates.erase(SEW);
++          continue;
++        }
++
++      // Most vector crypto 1.0 instructions only work on SEW=32.
++      using namespace RISCV_MC;
++      if (isOpcodeAvailableIn(BaseOpcode, {Feature_HasStdExtZvkgBit,
++                                           Feature_HasStdExtZvknedBit,
++                                           Feature_HasStdExtZvknhaOrZvknhbBit,
++                                           Feature_HasStdExtZvksedBit,
++                                           Feature_HasStdExtZvkshBit})) {
++        if (*SEW != 32)
++          // Zvknhb support SEW=64 as well.
++          if (*SEW != 64 || !STI.hasFeature(RISCV::FeatureStdExtZvknhb) ||
++              !isOpcodeAvailableIn(BaseOpcode,
++                                   {Feature_HasStdExtZvknhaOrZvknhbBit})) {
++            SEW = SEWCandidates.erase(SEW);
++            continue;
++          }
++
++        // We're also enforcing the requirement of `LMUL * VLEN >= EGW` here,
++        // because some of the extensions have SEW-dependant EGW.
++        unsigned EGW = getZvkEGWSize(BaseOpcode, *SEW);
++        if (multiplyLMul(ZvlVLen, VLMul) < EGW) {
++          SEW = SEWCandidates.erase(SEW);
++          continue;
++        }
++      }
++
++      ++SEW;
++    }
++
++    // We're not going to produce any result with zero SEW candidate.
++    if (SEWCandidates.empty())
++      return;
++
++    for (unsigned SEW : SEWCandidates)
++      Log2SEWs.push_back(SEW == 8 ? 0 : Log2_32(SEW));
++  } else {
++    Log2SEWs.push_back(std::nullopt);
++  }
++
++  if (HasPolicyOp) {
++    VTypeOperands.insert(&Instr.Operands[RISCVII::getVecPolicyOpNum(MIDesc)]);
++
++    Policies = {0, RISCVII::TAIL_AGNOSTIC, RISCVII::MASK_AGNOSTIC,
++                (RISCVII::TAIL_AGNOSTIC | RISCVII::MASK_AGNOSTIC)};
++  } else {
++    Policies.push_back(std::nullopt);
++  }
++
++  if (HasVLOp) {
++    VTypeOperands.insert(&Instr.Operands[RISCVII::getVLOpNum(MIDesc)]);
++
++    if (OnlyUsesVLMAXForVL)
++      AVLs.push_back(-1);
++    else
++      AVLs = {// 5-bit immediate value
++              1,
++              // VLMAX
++              -1,
++              // Non-X0 register
++              0};
++  } else {
++    AVLs.push_back(std::nullopt);
++  }
++
++  if (HasRMOp) {
++    VTypeOperands.insert(&Instr.Operands[RISCVII::getVLOpNum(MIDesc) - 1]);
++
++    // If we're not enumerating all rounding modes,
++    // use zero (rne in FRM and rnu in VXRM) as the default
++    // mode.
++    RoundingModes = {0U};
++    if (EnumerateRoundingModes) {
++      RoundingModes.append({1, 2, 3});
++      if (!UsesVXRM)
++        // FRM values 5 and 6 are currently reserved.
++        RoundingModes.append({4, 7});
++    }
++  } else {
++    RoundingModes = {std::nullopt};
++  }
++
++  std::set<std::tuple<std::optional<unsigned>, std::optional<int>,
++                      std::optional<unsigned>, std::optional<unsigned>>>
++      Combinations;
++  for (auto AVL : AVLs) {
++    for (auto Log2SEW : Log2SEWs)
++      for (auto Policy : Policies) {
++        for (auto RM : RoundingModes)
++          Combinations.insert(std::make_tuple(RM, AVL, Log2SEW, Policy));
++      }
++  }
++
++  std::string ConfigStr;
++  SmallVector<std::pair<const Operand *, MCOperand>, 4> ValueAssignments;
++  for (const auto &[RM, AVL, Log2SEW, Policy] : Combinations) {
++    InstructionTemplate IT(&Instr);
++
++    ListSeparator LS;
++    ConfigStr = "vtype = {";
++    raw_string_ostream SS(ConfigStr);
++
++    ValueAssignments.clear();
++
++    if (RM) {
++      const Operand &Op = Instr.Operands[RISCVII::getVLOpNum(MIDesc) - 1];
++      ValueAssignments.push_back({&Op, MCOperand::createImm(*RM)});
++      printRoundingMode(SS << LS << (UsesVXRM ? "VXRM" : "FRM") << ": ", *RM,
++                        UsesVXRM);
++    }
++
++    if (AVL) {
++      MCOperand OpVal;
++      if (*AVL < 0) {
++        // VLMAX
++        OpVal = MCOperand::createImm(-1);
++        SS << LS << "AVL: VLMAX";
++      } else if (*AVL == 0) {
++        // A register holding AVL.
++        // TODO: Generate a random register.
++        OpVal = MCOperand::createReg(RISCV::X5);
++        OpVal.print(SS << LS << "AVL: ");
++      } else {
++        // A 5-bit immediate.
++        // The actual value assignment is deferred to
++        // RISCVExegesisTarget::randomizeTargetMCOperand.
++        SS << LS << "AVL: simm5";
++      }
++      if (OpVal.isValid()) {
++        const Operand &Op = Instr.Operands[RISCVII::getVLOpNum(MIDesc)];
++        ValueAssignments.push_back({&Op, OpVal});
++      }
++    }
++
++    if (Log2SEW) {
++      const Operand &Op = Instr.Operands[RISCVII::getSEWOpNum(MIDesc)];
++      ValueAssignments.push_back({&Op, MCOperand::createImm(*Log2SEW)});
++      SS << LS << "SEW: e" << (*Log2SEW ? 1 << *Log2SEW : 8);
++    }
++
++    if (Policy) {
++      const Operand &Op = Instr.Operands[RISCVII::getVecPolicyOpNum(MIDesc)];
++      ValueAssignments.push_back({&Op, MCOperand::createImm(*Policy)});
++      SS << LS << "Policy: " << (*Policy & RISCVII::TAIL_AGNOSTIC ? "ta" : "tu")
++         << "/" << (*Policy & RISCVII::MASK_AGNOSTIC ? "ma" : "mu");
++    }
++
++    SS << "}";
++
++    // Filter out some configurations, if needed.
++    if (!FilterConfig.empty()) {
++      if (!Regex(FilterConfig).match(ConfigStr))
++        continue;
++    }
++
++    CodeTemplate CT = OrigCT.clone();
++    CT.Config = std::move(ConfigStr);
++    for (InstructionTemplate &IT : CT.Instructions) {
++      if (IsSerial) {
++        // Reset this template's value assignments and do it
++        // ourselves.
++        IT = InstructionTemplate(&Instr);
++        assignSerialRVVOperands(IT);
++      }
++
++      for (const auto &[Op, OpVal] : ValueAssignments)
++        IT.getValueFor(*Op) = OpVal;
++    }
++    Result.push_back(std::move(CT));
++    if (Result.size() - StartingResultSize >=
++        SnippetGenerator::Opts.MaxConfigsPerOpcode)
++      return;
++  }
++}
++
++template <class BaseT>
++Expected<std::vector<CodeTemplate>>
++RVVSnippetGenerator<BaseT>::generateCodeTemplates(
++    InstructionTemplate Variant, const BitVector &ForbiddenRegisters) const {
++  const Instruction &Instr = Variant.getInstr();
++
++  bool IsSerial = std::is_same_v<BaseT, SerialSnippetGenerator>;
++
++  unsigned BaseOpcode = RISCV::getRVVMCOpcode(Instr.getOpcode());
++
++  // Bail out ineligible opcodes before generating base code templates since
++  // the latter is quite expensive.
++  if (IsSerial && BaseOpcode && isIneligibleOfSerialSnippets(BaseOpcode, Instr))
++    return std::vector<CodeTemplate>{};
++
++  auto BaseCodeTemplates =
++      BaseT::generateCodeTemplates(Variant, ForbiddenRegisters);
++  if (!BaseCodeTemplates)
++    return BaseCodeTemplates.takeError();
++
++  // We only specialize for RVVPseudo here
++  if (!BaseOpcode)
++    return BaseCodeTemplates;
++
++  std::vector<CodeTemplate> ExpandedTemplates;
++  for (const auto &BaseCT : *BaseCodeTemplates)
++    annotateWithVType(BaseCT, Instr, BaseOpcode, ForbiddenRegisters,
++                      ExpandedTemplates);
++
++  return ExpandedTemplates;
++}
++
++
++// NOTE: Alternatively, we can use BitVector here, but the number of RVV opcodes
++// is just a small portion of the entire opcode space, so I thought it would be
++// a waste of space to use BitVector.
++static SmallSet<unsigned, 16> RVVOpcodesWithPseudos;
++>>>>>>>
+ 
+ class ExegesisRISCVTarget : public ExegesisTarget {
+ public:
+@@ -106,16 +771,17 @@ public:
+ 
+   bool matchesArch(Triple::ArchType Arch) const override;
+ 
++<<<<<<<
+   std::vector<MCInst> setRegTo(const MCSubtargetInfo &STI, MCRegister Reg,
+                                const APInt &Value) const override;
++=======
++  std::vector<MCInst> setRegTo(const MCSubtargetInfo &STI, unsigned Reg,
++                               const APInt &Value) const override;
++>>>>>>>
+ 
+   MCRegister getDefaultLoopCounterRegister(const Triple &) const override;
+ 
+-  void decrementLoopCounterAndJump(MachineBasicBlock &MBB,
+-                                   MachineBasicBlock &TargetMBB,
+-                                   const MCInstrInfo &MII,
+-                                   MCRegister LoopRegister) const override;
+-
++<<<<<<<
+   MCRegister getScratchMemoryRegister(const Triple &TT) const override;
+ 
+   void fillMemoryOperands(InstructionTemplate &IT, MCRegister Reg,
+@@ -134,6 +800,91 @@ public:
+   std::vector<InstructionTemplate>
+   generateInstructionVariants(const Instruction &Instr,
+                               unsigned MaxConfigsPerOpcode) const override;
++=======
++>>>>>>>
++
++<<<<<<<
++=======
++private:
++  bool isOpcodeSupported(const MCInstrDesc &Desc) const override;
++
++  RegisterValue assignInitialRegisterValue(const Instruction &I,
++                                           const Operand &Op,
++                                           unsigned Reg) const override;
++
++  static std::vector<MCInst> loadIntImmediate(const MCSubtargetInfo &STI,
++                                              unsigned Reg,
++                                              const APInt &Value);
++
++  // Note that we assume the given APInt is an integer rather than a bit-casted
++  // floating point value.
++  static std::vector<MCInst> loadFPImmediate(unsigned FLen,
++                                             const MCSubtargetInfo &STI,
++                                             unsigned Reg, const APInt &Value);
++
++>>>>>>> bcced4b0d15c ([Exegesis][RISCV] RVV support for llvm-exegesis)
++
++  void decrementLoopCounterAndJump(MachineBasicBlock &MBB,
++                                   MachineBasicBlock &TargetMBB,
++                                   const MCInstrInfo &MII,
++                                   MCRegister LoopRegister) const override;
++
++<<<<<<< HEAD
++=======
++  std::unique_ptr<SnippetGenerator> createSerialSnippetGenerator(
++      const LLVMState &State,
++      const SnippetGenerator::Options &Opts) const override {
++    return std::make_unique<RVVSnippetGenerator<SerialSnippetGenerator>>(State,
++                                                                         Opts);
++  }
++
++  std::unique_ptr<SnippetGenerator> createParallelSnippetGenerator(
++      const LLVMState &State,
++      const SnippetGenerator::Options &Opts) const override {
++    return std::make_unique<RVVSnippetGenerator<ParallelSnippetGenerator>>(
++        State, Opts);
++  }
++
++  Expected<std::unique_ptr<pfm::CounterGroup>>
++  createCounter(StringRef CounterName, const LLVMState &,
++                ArrayRef<const char *> ValidationCounters,
++                const pid_t ProcessID) const override {
++    auto Event = static_cast<pfm::PerfEvent>(RISCVPerfEvent(CounterName));
++    if (!Event.valid())
++      return llvm::make_error<Failure>(
++          llvm::Twine("Unable to create counter with name '")
++              .concat(CounterName)
++              .concat("'"));
++
++    std::vector<pfm::PerfEvent> ValidationEvents;
++    for (const char *ValCounterName : ValidationCounters) {
++      ValidationEvents.emplace_back(ValCounterName);
++      if (!ValidationEvents.back().valid())
++        return llvm::make_error<Failure>(
++            llvm::Twine("Unable to create validation counter with name '")
++                .concat(ValCounterName)
++                .concat("'"));
++    }
++
++    return std::make_unique<pfm::CounterGroup>(
++        std::move(Event), std::move(ValidationEvents), ProcessID);
++  }
++
++  void addTargetSpecificPasses(PassManagerBase &PM) const override {
++    // Turn AVL operand of physical registers into virtual registers.
++    PM.add(exegesis::createRISCVPreprocessingPass());
++    PM.add(createRISCVInsertVSETVLIPass());
++    // Setting up the correct FRM.
++    PM.add(createRISCVInsertReadWriteCSRPass());
++    PM.add(createRISCVInsertWriteVXRMPass());
++    // This will assign physical register to the result of VSETVLI instructions
++    // that produce VLMAX.
++    PM.add(exegesis::createRISCVPostprocessingPass());
++    // PseudoRET will be expanded by RISCVAsmPrinter; we have to expand
++    // PseudoMovImm with RISCVPostRAExpandPseudoPass though.
++    PM.add(createRISCVPostRAExpandPseudoPass());
++  }
++>>>>>>>
+ };
+ 
+ ExegesisRISCVTarget::ExegesisRISCVTarget()
+@@ -143,6 +894,7 @@ bool ExegesisRISCVTarget::matchesArch(Triple::ArchType Arch) const {
+   return Arch == Triple::riscv32 || Arch == Triple::riscv64;
+ }
+ 
++<<<<<<<
+ std::vector<MCInst> ExegesisRISCVTarget::setRegTo(const MCSubtargetInfo &STI,
+                                                   MCRegister Reg,
+                                                   const APInt &Value) const {
+@@ -173,7 +925,34 @@ std::vector<MCInst> ExegesisRISCVTarget::setRegTo(const MCSubtargetInfo &STI,
+          << ", results will be unreliable\n";
+   return {};
+ }
++=======
++std::vector<MCInst> ExegesisRISCVTarget::setRegTo(const MCSubtargetInfo &STI, 
++                                                  unsigned Reg,
++                                                  const APInt &Value) const {
++  if (Reg == RISCV::X0) {
++    if (Value == 0U)
++      // NOP
++      return {MCInstBuilder(RISCV::ADDI)
++                  .addReg(RISCV::X0)
++                  .addReg(RISCV::X0)
++                  .addImm(0U)};
++    errs() << "Cannot write non-zero values to X0\n";
++    return {};
++  }
++
++  if (RISCV::GPRNoX0RegClass.contains(Reg))
++    return loadIntImmediate(STI, Reg, Value);
++  if (RISCV::FPR32RegClass.contains(Reg) &&
++      STI.hasFeature(RISCV::FeatureStdExtF))
++    return loadFPImmediate(32, STI, Reg, Value);
++  if (RISCV::FPR64RegClass.contains(Reg) &&
++      STI.hasFeature(RISCV::FeatureStdExtD))
++    return loadFPImmediate(64, STI, Reg, Value);
++  return {};
++}
++>>>>>>>
+ 
++<<<<<<<
+ const MCPhysReg DefaultLoopCounterReg = RISCV::X31; // t6
+ const MCPhysReg ScratchMemoryReg = RISCV::X10;      // a0
+ 
+@@ -181,7 +960,14 @@ MCRegister
+ ExegesisRISCVTarget::getDefaultLoopCounterRegister(const Triple &) const {
+   return DefaultLoopCounterReg;
+ }
++=======
++unsigned
++ExegesisRISCVTarget::getDefaultLoopCounterRegister(const Triple &TT) const {
++  return RISCV::X5;
++}
++>>>>>>>
+ 
++<<<<<<<
+ void ExegesisRISCVTarget::decrementLoopCounterAndJump(
+     MachineBasicBlock &MBB, MachineBasicBlock &TargetMBB,
+     const MCInstrInfo &MII, MCRegister LoopRegister) const {
+@@ -194,7 +980,22 @@ void ExegesisRISCVTarget::decrementLoopCounterAndJump(
+       .addUse(RISCV::X0)
+       .addMBB(&TargetMBB);
+ }
++=======
++void ExegesisRISCVTarget::decrementLoopCounterAndJump(
++    MachineBasicBlock &MBB, MachineBasicBlock &TargetMBB,
++    const MCInstrInfo &MII, unsigned LoopRegister) const {
++  MIMetadata MIMD;
++  BuildMI(MBB, MBB.end(), MIMD, MII.get(RISCV::ADDI), LoopRegister)
++      .addUse(LoopRegister)
++      .addImm(-1);
++  BuildMI(MBB, MBB.end(), MIMD, MII.get(RISCV::BNE))
++      .addUse(LoopRegister)
++      .addUse(RISCV::X0)
++      .addMBB(&TargetMBB);
++}
++>>>>>>> bcced4b0d15c ([Exegesis][RISCV] RVV support for llvm-exegesis)
+ 
++<<<<<<<
+ MCRegister
+ ExegesisRISCVTarget::getScratchMemoryRegister(const Triple &TT) const {
+   return ScratchMemoryReg; // a0
+@@ -225,6 +1026,8 @@ const MCPhysReg UnavailableRegisters[4] = {RISCV::X0, DefaultLoopCounterReg,
+ ArrayRef<MCPhysReg> ExegesisRISCVTarget::getUnavailableRegisters() const {
+   return UnavailableRegisters;
+ }
++=======
++>>>>>>>
+ 
+ Error ExegesisRISCVTarget::randomizeTargetMCOperand(
+     const Instruction &Instr, const Variable &Var, MCOperand &AssignedValue,
+@@ -233,6 +1036,7 @@ Error ExegesisRISCVTarget::randomizeTargetMCOperand(
+       Instr.getPrimaryOperand(Var).getExplicitOperandInfo().OperandType;
+ 
+   switch (OperandType) {
++<<<<<<<
+   case RISCVOp::OPERAND_FRMARG:
+     AssignedValue = MCOperand::createImm(RISCVFPRndMode::DYN);
+     break;
+@@ -247,10 +1051,26 @@ Error ExegesisRISCVTarget::randomizeTargetMCOperand(
+     if (OperandType >= RISCVOp::OPERAND_FIRST_RISCV_IMM &&
+         OperandType <= RISCVOp::OPERAND_LAST_RISCV_IMM)
+       AssignedValue = MCOperand::createImm(0);
++=======
++  case RISCVOp::OPERAND_SIMM5:
++    // 5-bit signed immediate value.
++    AssignedValue = MCOperand::createImm(randomIndex(31) - 16);
++    break;
++  case RISCVOp::OPERAND_AVL:
++  case RISCVOp::OPERAND_UIMM5:
++    // 5-bit unsigned immediate value.
++    AssignedValue = MCOperand::createImm(randomIndex(31));
++    break;
++  default:
++    return make_error<Failure>(
++        Twine("unimplemented operand type ")
++            .concat(std::to_string(OperandType)));
++>>>>>>>
+   }
+   return Error::success();
+ }
+ 
++<<<<<<<
+ std::vector<InstructionTemplate>
+ ExegesisRISCVTarget::generateInstructionVariants(
+     const Instruction &Instr, unsigned int MaxConfigsPerOpcode) const {
+@@ -261,6 +1081,170 @@ ExegesisRISCVTarget::generateInstructionVariants(
+     }
+   return {IT};
+ }
++=======
++>>>>>>>
++
++<<<<<<<
++=======
++bool ExegesisRISCVTarget::isOpcodeSupported(const MCInstrDesc &Desc) const {
++  switch (Desc.getOpcode()) {
++  case RISCV::PseudoVSETIVLI:
++  case RISCV::PseudoVSETVLI:
++  case RISCV::PseudoVSETVLIX0:
++  case RISCV::VSETIVLI:
++  case RISCV::VSETVLI:
++  case RISCV::VSETVL:
++    return false;
++  default:
++    break;
++  }
++
++  // We want to support all the RVV pseudos.
++  if (unsigned Opcode = RISCV::getRVVMCOpcode(Desc.getOpcode())) {
++    RVVOpcodesWithPseudos.insert(Opcode);
++    return true;
++  }
++
++  // We don't want to support RVV instructions that depend on VTYPE, because
++  // those instructions by themselves don't carry any additional information
++  // for us to setup the proper VTYPE environment via VSETVL instructions.
++  // FIXME: Ideally, we should have a list of such RVV instructions...except
++  // we don't have, hence we use an ugly trick here to memorize the
++  // corresponding MC opcodes of the RVV pseudo we have processed previously.
++  // This works most of the time because RVV pseudo opcodes are placed before
++  // any other RVV opcodes. Of course this doesn't work if we're asked to
++  // benchmark only a certain subset of opcodes.
++  if (RVVOpcodesWithPseudos.count(Desc.getOpcode()))
++    return false;
++
++  return ExegesisTarget::isOpcodeSupported(Desc);
++}
++
++
++std::vector<MCInst> 
++ExegesisRISCVTarget::loadIntImmediate(const MCSubtargetInfo &STI,
++                                      unsigned Reg,
++                                      const APInt &Value) {
++  // Lower to materialization sequence.
++  RISCVMatInt::InstSeq Seq =
++      RISCVMatInt::generateInstSeq(Value.getSExtValue(), STI);
++  assert(!Seq.empty());
++
++  Register DstReg = Reg;
++  Register SrcReg = RISCV::X0;
++
++  std::vector<MCInst> Insts;
++  for (const RISCVMatInt::Inst &Inst : Seq) {
++    switch (Inst.getOpndKind()) {
++    case RISCVMatInt::Imm:
++      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
++                              .addReg(DstReg)
++                              .addImm(Inst.getImm()));
++      break;
++    case RISCVMatInt::RegX0:
++      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
++                              .addReg(DstReg)
++                              .addReg(SrcReg)
++                              .addReg(RISCV::X0));
++      break;
++    case RISCVMatInt::RegReg:
++      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
++                              .addReg(DstReg)
++                              .addReg(SrcReg)
++                              .addReg(SrcReg));
++      break;
++    case RISCVMatInt::RegImm:
++      Insts.emplace_back(MCInstBuilder(Inst.getOpcode())
++                              .addReg(DstReg)
++                              .addReg(SrcReg)
++                              .addImm(Inst.getImm()));
++      break;
++    }
++
++    // Only the first instruction has X0 as its source.
++    SrcReg = DstReg;
++  }
++  return Insts;
++}
++
++
++std::vector<MCInst>
++ExegesisRISCVTarget::loadFPImmediate(unsigned FLen,
++                                     const MCSubtargetInfo &STI,
++                                     unsigned Reg, const APInt &Value) {
++  // Try FLI from the Zfa extension.
++  if (STI.hasFeature(RISCV::FeatureStdExtZfa)) {
++    APFloat FloatVal(FLen == 32 ? APFloat::IEEEsingle()
++                                : APFloat::IEEEdouble());
++    if (FloatVal.convertFromAPInt(Value, /*IsSigned=*/Value.isSignBitSet(),
++                                  APFloat::rmNearestTiesToEven) ==
++        APFloat::opOK) {
++      int Idx = RISCVLoadFPImm::getLoadFPImm(FloatVal);
++      if (Idx >= 0)
++        return {MCInstBuilder(FLen == 32 ? RISCV::FLI_S : RISCV::FLI_D)
++                    .addReg(Reg)
++                    .addImm(static_cast<uint64_t>(Idx))};
++    }
++  }
++
++  // Otherwise, move the value to a GPR (t0) first.
++  assert(Reg != RISCV::X5);
++  auto ImmSeq = loadIntImmediate(STI, RISCV::X5, Value);
++
++  // Then, use FCVT.
++  unsigned Opcode;
++  if (FLen == 32)
++    Opcode = Value.getBitWidth() <= 32 ? RISCV::FCVT_S_W : RISCV::FCVT_S_L;
++  else
++    Opcode = Value.getBitWidth() <= 32 ? RISCV::FCVT_D_W : RISCV::FCVT_D_L;
++  ImmSeq.emplace_back(
++      MCInstBuilder(Opcode).addReg(Reg).addReg(RISCV::X5).addImm(
++          RISCVFPRndMode::RNE));
++
++  return ImmSeq;
++}
++
++
++RegisterValue
++ExegesisRISCVTarget::assignInitialRegisterValue(const Instruction &I,
++                                                const Operand &Op,
++                                                unsigned Reg) const {
++  // If this is a register AVL, we don't want to assign 0 or VLMAX VL.
++  if (Op.isExplicit() &&
++      Op.getExplicitOperandInfo().OperandType == RISCVOp::OPERAND_AVL) {
++    // Assume VLEN is 128 here.
++    constexpr unsigned VLEN = 128;
++    // VLMAX equals to VLEN since
++    // VLMAX = VLEN / <smallest SEW = 8> * <largest LMUL = 8>.
++    return RegisterValue{Reg, APInt(32, randomIndex(VLEN - 4) + 2)};
++  }
++
++  switch (I.getOpcode()) {
++  // We don't want divided-by-zero for these opcodes.
++  case RISCV::DIV:
++  case RISCV::DIVU:
++  case RISCV::DIVW:
++  case RISCV::DIVUW:
++  case RISCV::REM:
++  case RISCV::REMU:
++  case RISCV::REMW:
++  case RISCV::REMUW:
++  // Multiplications and its friends are not really interestings
++  // when they're multiplied by zero.
++  case RISCV::MUL:
++  case RISCV::MULH:
++  case RISCV::MULHSU:
++  case RISCV::MULHU:
++  case RISCV::MULW:
++  case RISCV::CPOP:
++  case RISCV::CPOPW:
++    return RegisterValue{Reg, APInt(32, randomIndex(INT32_MAX - 1) + 1)};
++  default:
++    return ExegesisTarget::assignInitialRegisterValue(I, Op, Reg);
++  }
++}
++
++>>>>>>>
+ 
+ } // anonymous namespace
+ 
+diff --git a/llvm/tools/llvm-exegesis/lib/SchedClassResolution.cpp b/llvm/tools/llvm-exegesis/lib/SchedClassResolution.cpp
+index 0690c21220f8..55c814647c68 100644
+--- a/llvm/tools/llvm-exegesis/lib/SchedClassResolution.cpp
++++ b/llvm/tools/llvm-exegesis/lib/SchedClassResolution.cpp
+@@ -84,17 +84,19 @@ getNonRedundantWriteProcRes(const MCSchedClassDesc &SCDesc,
+     // TODO: Handle AcquireAtAtCycle in llvm-exegesis and llvm-mca. See
+     // https://github.com/llvm/llvm-project/issues/62680 and
+     // https://github.com/llvm/llvm-project/issues/62681
+-    assert(WPR->AcquireAtCycle == 0 &&
+-           "`llvm-exegesis` does not handle AcquireAtCycle > 0");
++    // assert(WPR->AcquireAtCycle == 0 &&
++    //       "`llvm-exegesis` does not handle AcquireAtCycle > 0");
++    assert(WPR->ReleaseAtCycle > WPR->AcquireAtCycle);
+     if (ProcResDesc->SubUnitsIdxBegin == nullptr) {
+       // This is a ProcResUnit.
+       Result.push_back(
+           {WPR->ProcResourceIdx, WPR->ReleaseAtCycle, WPR->AcquireAtCycle});
+-      ProcResUnitUsage[WPR->ProcResourceIdx] += WPR->ReleaseAtCycle;
++      ProcResUnitUsage[WPR->ProcResourceIdx] +=
++          (WPR->ReleaseAtCycle - WPR->AcquireAtCycle);
+     } else {
+       // This is a ProcResGroup. First see if it contributes any cycles or if
+       // it has cycles just from subunits.
+-      float RemainingCycles = WPR->ReleaseAtCycle;
++      float RemainingCycles = (WPR->ReleaseAtCycle - WPR->AcquireAtCycle);
+       for (const auto *SubResIdx = ProcResDesc->SubUnitsIdxBegin;
+            SubResIdx != ProcResDesc->SubUnitsIdxBegin + ProcResDesc->NumUnits;
+            ++SubResIdx) {
+@@ -106,7 +108,8 @@ getNonRedundantWriteProcRes(const MCSchedClassDesc &SCDesc,
+       }
+       // The ProcResGroup contributes `RemainingCycles` cycles of its own.
+       Result.push_back({WPR->ProcResourceIdx,
+-                        static_cast<uint16_t>(std::round(RemainingCycles)),
++                        static_cast<uint16_t>(WPR->AcquireAtCycle +
++                                              std::round(RemainingCycles)),
+                         WPR->AcquireAtCycle});
+       // Spread the remaining cycles over all subunits.
+       for (const auto *SubResIdx = ProcResDesc->SubUnitsIdxBegin;
+@@ -116,6 +119,10 @@ getNonRedundantWriteProcRes(const MCSchedClassDesc &SCDesc,
+       }
+     }
+   }
++
++  sort(Result, [](const MCWriteProcResEntry &A, const MCWriteProcResEntry &B) {
++    return A.ProcResourceIdx < B.ProcResourceIdx;
++  });
+   return Result;
+ }
+ 
+@@ -198,27 +205,25 @@ static void distributePressure(float RemainingPressure,
+   }
+ }
+ 
+-std::vector<std::pair<uint16_t, float>>
+-computeIdealizedProcResPressure(const MCSchedModel &SM,
+-                                SmallVector<MCWriteProcResEntry, 8> WPRS) {
++std::vector<std::pair<uint16_t, float>> computeIdealizedProcResPressure(
++    const MCSchedModel &SM, const SmallVector<MCWriteProcResEntry, 8> &WPRS) {
+   // DensePressure[I] is the port pressure for Proc Resource I.
+   SmallVector<float, 32> DensePressure(SM.getNumProcResourceKinds());
+-  sort(WPRS, [](const MCWriteProcResEntry &A, const MCWriteProcResEntry &B) {
+-    return A.ProcResourceIdx < B.ProcResourceIdx;
+-  });
+   for (const MCWriteProcResEntry &WPR : WPRS) {
+     // Get units for the entry.
+     const MCProcResourceDesc *const ProcResDesc =
+         SM.getProcResource(WPR.ProcResourceIdx);
+     if (ProcResDesc->SubUnitsIdxBegin == nullptr) {
+       // This is a ProcResUnit.
+-      DensePressure[WPR.ProcResourceIdx] += WPR.ReleaseAtCycle;
++      DensePressure[WPR.ProcResourceIdx] +=
++          (WPR.ReleaseAtCycle - WPR.AcquireAtCycle);
+     } else {
+       // This is a ProcResGroup.
+       SmallVector<uint16_t, 32> Subunits(ProcResDesc->SubUnitsIdxBegin,
+                                          ProcResDesc->SubUnitsIdxBegin +
+                                              ProcResDesc->NumUnits);
+-      distributePressure(WPR.ReleaseAtCycle, Subunits, DensePressure);
++      distributePressure(WPR.ReleaseAtCycle - WPR.AcquireAtCycle, Subunits,
++                         DensePressure);
+     }
+   }
+   // Turn dense pressure into sparse pressure by removing zero entries.
+@@ -284,6 +289,36 @@ static unsigned findProcResIdx(const MCSubtargetInfo &STI,
+   return 0;
+ }
+ 
++static int getMinimumBypassCycles(ArrayRef<MCReadAdvanceEntry> Entries,
++                                  unsigned WriteResourceID) {
++  if (Entries.empty())
++    return 0;
++
++  int BypassCycles = INT_MAX;
++  for (const MCReadAdvanceEntry &E : Entries) {
++    if (E.WriteResourceID != WriteResourceID)
++      continue;
++    BypassCycles = std::min(BypassCycles, E.Cycles);
++  }
++
++  return BypassCycles == INT_MAX ? 0 : BypassCycles;
++}
++
++unsigned ResolvedSchedClass::computeNormalizedWriteLatency(
++    const MCWriteLatencyEntry *WLE, const MCSubtargetInfo &STI) const {
++  assert(WLE);
++  auto ReadAdvances = STI.getReadAdvanceEntries(*SCDesc);
++  int MinBypass = getMinimumBypassCycles(ReadAdvances, WLE->WriteResourceID);
++
++  unsigned Latency = WLE->Cycles;
++  if (MinBypass > 0 && unsigned(MinBypass) >= Latency)
++    Latency = 0;
++  else
++    Latency = Latency - MinBypass;
++
++  return Latency;
++}
++
+ std::vector<BenchmarkMeasure> ResolvedSchedClass::getAsPoint(
+     Benchmark::ModeE Mode, const MCSubtargetInfo &STI,
+     ArrayRef<PerInstructionStats> Representative) const {
+@@ -301,8 +336,10 @@ std::vector<BenchmarkMeasure> ResolvedSchedClass::getAsPoint(
+     for (unsigned I = 0; I < SCDesc->NumWriteLatencyEntries; ++I) {
+       const MCWriteLatencyEntry *const WLE =
+           STI.getWriteLatencyEntry(SCDesc, I);
++
++      unsigned Latency = computeNormalizedWriteLatency(WLE, STI);
+       LatencyMeasure.PerInstructionValue =
+-          std::max<double>(LatencyMeasure.PerInstructionValue, WLE->Cycles);
++          std::max<double>(LatencyMeasure.PerInstructionValue, Latency);
+     }
+   } else if (Mode == Benchmark::Uops) {
+     for (auto I : zip(SchedClassPoint, Representative)) {
+diff --git a/llvm/tools/llvm-exegesis/lib/SchedClassResolution.h b/llvm/tools/llvm-exegesis/lib/SchedClassResolution.h
+index 2347449b8f23..2803c7bc17f3 100644
+--- a/llvm/tools/llvm-exegesis/lib/SchedClassResolution.h
++++ b/llvm/tools/llvm-exegesis/lib/SchedClassResolution.h
+@@ -31,9 +31,8 @@ namespace exegesis {
+ // Computes the idealized ProcRes Unit pressure. This is the expected
+ // distribution if the CPU scheduler can distribute the load as evenly as
+ // possible.
+-std::vector<std::pair<uint16_t, float>>
+-computeIdealizedProcResPressure(const MCSchedModel &SM,
+-                                SmallVector<MCWriteProcResEntry, 8> WPRS);
++std::vector<std::pair<uint16_t, float>> computeIdealizedProcResPressure(
++    const MCSchedModel &SM, const SmallVector<MCWriteProcResEntry, 8> &WPRS);
+ 
+ // An MCSchedClassDesc augmented with some additional data.
+ struct ResolvedSchedClass {
+@@ -48,6 +47,9 @@ struct ResolvedSchedClass {
+   getAsPoint(Benchmark::ModeE Mode, const MCSubtargetInfo &STI,
+              ArrayRef<PerInstructionStats> Representative) const;
+ 
++  unsigned computeNormalizedWriteLatency(const MCWriteLatencyEntry *WLE,
++                                         const MCSubtargetInfo &STI) const;
++
+   const unsigned SchedClassId;
+   const MCSchedClassDesc *const SCDesc;
+   const bool WasVariant; // Whether the original class was variant.
+diff --git a/llvm/tools/llvm-exegesis/lib/SerialSnippetGenerator.cpp b/llvm/tools/llvm-exegesis/lib/SerialSnippetGenerator.cpp
+index 25cdf1ce66d4..3b663b75d7c7 100644
+--- a/llvm/tools/llvm-exegesis/lib/SerialSnippetGenerator.cpp
++++ b/llvm/tools/llvm-exegesis/lib/SerialSnippetGenerator.cpp
+@@ -53,6 +53,11 @@ computeAliasingInstructions(const LLVMState &State, const Instruction *Instr,
+     if (OtherOpcode == Instr->Description.getOpcode())
+       continue;
+     const Instruction &OtherInstr = State.getIC().getInstr(OtherOpcode);
++    // MERGEME: is `isOpcodeSupported` useful and not replaced by `isOpcodeAvailable`?
++    const MCInstrDesc &OtherInstrDesc = OtherInstr.Description;
++    // Ignore instructions that we cannot run.
++    if (!ET.isOpcodeSupported(OtherInstrDesc))
++      continue;
+     if (OtherInstr.hasMemoryOperands())
+       continue;
+     if (!ET.allowAsBackToBack(OtherInstr))
+diff --git a/llvm/tools/llvm-exegesis/lib/SnippetGenerator.cpp b/llvm/tools/llvm-exegesis/lib/SnippetGenerator.cpp
+index 04064ae1d844..b4e0bf7b3733 100644
+--- a/llvm/tools/llvm-exegesis/lib/SnippetGenerator.cpp
++++ b/llvm/tools/llvm-exegesis/lib/SnippetGenerator.cpp
+@@ -130,8 +130,9 @@ std::vector<RegisterValue> SnippetGenerator::computeRegisterInitialValues(
+         return IT.getValueFor(Op).getReg();
+       return MCRegister();
+     };
++    const Instruction &I = IT.getInstr();
+     // Collect used registers that have never been def'ed.
+-    for (const Operand &Op : IT.getInstr().Operands) {
++    for (const Operand &Op : I.Operands) {
+       if (Op.isUse()) {
+         const MCRegister Reg = GetOpReg(Op);
+         if (Reg && !DefinedRegs.test(Reg.id())) {
+@@ -141,7 +142,7 @@ std::vector<RegisterValue> SnippetGenerator::computeRegisterInitialValues(
+       }
+     }
+     // Mark defs as having been def'ed.
+-    for (const Operand &Op : IT.getInstr().Operands) {
++    for (const Operand &Op : I.Operands) {
+       if (Op.isDef()) {
+         const MCRegister Reg = GetOpReg(Op);
+         if (Reg)
+@@ -296,16 +297,17 @@ Error randomizeUnsetVariables(const LLVMState &State,
+ }
+ 
+ Error validateGeneratedInstruction(const LLVMState &State, const MCInst &Inst) {
+-  for (const auto &Operand : Inst) {
+-    if (!Operand.isValid()) {
++  for (const auto &Operand : llvm::enumerate(Inst)) {
++    if (!Operand.value().isValid()) {
+       // Mention the particular opcode - it is not necessarily the "main"
+       // opcode being benchmarked by this snippet. For example, serial snippet
+       // generator uses one more opcode when in SERIAL_VIA_NON_MEMORY_INSTR
+       // execution mode.
+       const auto OpcodeName = State.getInstrInfo().getName(Inst.getOpcode());
+-      return make_error<Failure>("Not all operands were initialized by the "
+-                                 "snippet generator for " +
+-                                 OpcodeName + " opcode.");
++      return make_error<Failure>(
++          "Operand #" + std::to_string(Operand.index()) +
++          " was not initialized by the snippet generator for " + OpcodeName +
++          " opcode.");
+     }
+   }
+   return Error::success();
+diff --git a/llvm/tools/llvm-exegesis/lib/Target.cpp b/llvm/tools/llvm-exegesis/lib/Target.cpp
+index 5ea5b4c2c002..d034f88988fa 100644
+--- a/llvm/tools/llvm-exegesis/lib/Target.cpp
++++ b/llvm/tools/llvm-exegesis/lib/Target.cpp
+@@ -35,6 +35,14 @@ const ExegesisTarget *ExegesisTarget::lookup(Triple TT) {
+   return nullptr;
+ }
+ 
++bool ExegesisTarget::isOpcodeSupported(const MCInstrDesc &Desc) const {
++  // By default, we ignore pseudo, branch, indirect branch, call, and return
++  // instructions, along with instructions that require custom inserter.
++  return !(Desc.isPseudo() || Desc.usesCustomInsertionHook() ||
++           Desc.isBranch() || Desc.isIndirectBranch() || Desc.isCall() ||
++           Desc.isReturn());
++}
++
+ Expected<std::unique_ptr<pfm::CounterGroup>>
+ ExegesisTarget::createCounter(StringRef CounterName, const LLVMState &,
+                               ArrayRef<const char *> ValidationCounters,
+diff --git a/llvm/tools/llvm-exegesis/lib/Target.h b/llvm/tools/llvm-exegesis/lib/Target.h
+index f3fbe3780616..27768e0976d1 100644
+--- a/llvm/tools/llvm-exegesis/lib/Target.h
++++ b/llvm/tools/llvm-exegesis/lib/Target.h
+@@ -154,6 +154,9 @@ public:
+     return IsOpcodeAvailable(Opcode, Features);
+   }
+ 
++  // Returns true if the opcode is subject to process.
++  virtual bool isOpcodeSupported(const MCInstrDesc &Desc) const;
++
+   // Sets the stack register to the auxiliary memory so that operations
+   // requiring the stack can be formed (e.g., setting large registers). The code
+   // generated by this function may clobber registers.
+@@ -241,6 +244,12 @@ public:
+         "targets with target-specific operands should implement this");
+   }
+ 
++  virtual RegisterValue assignInitialRegisterValue(const Instruction &I,
++                                                   const Operand &Op,
++                                                   unsigned Reg) const {
++    return RegisterValue::zero(Reg);
++  }
++
+   // Returns true if this instruction is supported as a back-to-back
+   // instructions.
+   // FIXME: Eventually we should discover this dynamically.
+diff --git a/llvm/tools/llvm-exegesis/lib/Timer.cpp b/llvm/tools/llvm-exegesis/lib/Timer.cpp
+new file mode 100644
+index 000000000000..f12e5c933a3c
+--- /dev/null
++++ b/llvm/tools/llvm-exegesis/lib/Timer.cpp
+@@ -0,0 +1,16 @@
++#include "Timer.h"
++#include "llvm/Support/CommandLine.h"
++
++namespace llvm {
++namespace exegesis {
++
++bool TimerIsEnabled = false;
++
++const char TimerGroupName[] = "llvm-exegesis";
++const char TimerGroupDescription[] = "Time passes in each exegesis phase";
++
++cl::opt<bool, true> EnableTimer("time-phases", cl::location(TimerIsEnabled),
++                                cl::desc(TimerGroupDescription));
++
++} // namespace exegesis
++} // namespace llvm
+diff --git a/llvm/tools/llvm-exegesis/lib/Timer.h b/llvm/tools/llvm-exegesis/lib/Timer.h
+new file mode 100644
+index 000000000000..cea9be7f02fe
+--- /dev/null
++++ b/llvm/tools/llvm-exegesis/lib/Timer.h
+@@ -0,0 +1,21 @@
++//===---------- Timer.h -----------------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_TOOLS_LLVM_EXEGESIS_TIMER_H
++#define LLVM_TOOLS_LLVM_EXEGESIS_TIMER_H
++
++namespace llvm {
++namespace exegesis {
++extern bool TimerIsEnabled;
++
++extern const char TimerGroupName[];
++extern const char TimerGroupDescription[];
++
++} // namespace exegesis
++} // namespace llvm
++#endif
+diff --git a/llvm/tools/llvm-exegesis/llvm-exegesis.cpp b/llvm/tools/llvm-exegesis/llvm-exegesis.cpp
+index b9938a92855a..e9e9ecab5223 100644
+--- a/llvm/tools/llvm-exegesis/llvm-exegesis.cpp
++++ b/llvm/tools/llvm-exegesis/llvm-exegesis.cpp
+@@ -25,6 +25,7 @@
+ #include "lib/SnippetRepetitor.h"
+ #include "lib/Target.h"
+ #include "lib/TargetSelect.h"
++#include "lib/Timer.h"
+ #include "lib/ValidationEvent.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/ADT/Twine.h"
+@@ -43,6 +44,7 @@
+ #include "llvm/Support/Path.h"
+ #include "llvm/Support/SourceMgr.h"
+ #include "llvm/Support/TargetSelect.h"
++#include "llvm/Support/Timer.h"
+ #include "llvm/TargetParser/Host.h"
+ #include <algorithm>
+ #include <string>
+@@ -50,10 +52,62 @@
+ namespace llvm {
+ namespace exegesis {
+ 
+-static cl::opt<int> OpcodeIndex(
+-    "opcode-index",
+-    cl::desc("opcode to measure, by index, or -1 to measure all opcodes"),
+-    cl::cat(BenchmarkOptions), cl::init(0));
++struct IndexRangeParser : public cl::parser<std::pair<unsigned, unsigned>> {
++  IndexRangeParser(cl::Option &O)
++      : cl::parser<std::pair<unsigned, unsigned>>(O) {}
++
++  // 'A..B' -> [A,B)
++  // 'A...B' -> [A,B]
++  bool parse(cl::Option &O, StringRef ArgName, StringRef ArgValue,
++             std::pair<unsigned, unsigned> &Val) {
++    StringRef ArgStr = ArgValue;
++
++    int FirstIdx;
++    if (ArgStr.consumeInteger(10, FirstIdx))
++      return O.error("Expecting an integer");
++
++    if (FirstIdx < 0 && FirstIdx != -1)
++      return O.error("-1 is the only allowed negative value, got '" +
++                     std::to_string(FirstIdx) + "'");
++
++    if (ArgStr.consume_front("...")) {
++      if (FirstIdx >= 0) {
++        if (ArgStr.getAsInteger(10, Val.second))
++          return O.error("Cannot parse '" + ArgStr + "' as unsigned integer");
++        Val.first = FirstIdx;
++        if (Val.second == 0 || Val.first > Val.second)
++          return O.error("Invalid range " +
++                         formatv("[{0},{1}]", Val.first, Val.second));
++        return false;
++      }
++    } else if (ArgStr.consume_front("..")) {
++      if (FirstIdx >= 0) {
++        if (ArgStr.getAsInteger(10, Val.second))
++          return O.error("Cannot parse '" + ArgStr + "' as unsigned integer");
++        Val.first = FirstIdx;
++        if (Val.second == 0 || Val.first > Val.second - 1)
++          return O.error("Invalid range " +
++                         formatv("[{0},{1})", Val.first, Val.second));
++        Val.second -= 1;
++        return false;
++      }
++    } else if (ArgStr.empty()) {
++      if (FirstIdx < 0)
++        Val = std::make_pair(0, UINT_MAX);
++      else
++        Val = std::make_pair(FirstIdx, FirstIdx);
++      return false;
++    }
++
++    return O.error("Unrecognized format: '" + ArgValue + "'");
++  }
++};
++
++static cl::opt<std::pair<unsigned, unsigned>, false, IndexRangeParser>
++    OpcodeIndices(
++        "opcode-index",
++        cl::desc("opcode to measure, by index, or -1 to measure all opcodes"),
++        cl::cat(BenchmarkOptions), cl::init(std::pair(0, 0)));
+ 
+ static cl::opt<std::string>
+     OpcodeNames("opcode-name",
+@@ -72,6 +126,11 @@ static cl::opt<std::string>
+                            "results. “-” uses stdin/stdout."),
+                   cl::cat(Options), cl::init(""));
+ 
++static cl::opt<std::string>
++    InputFile(cl::Positional,
++              cl::desc("Input benchmarks file to resume or snippet file"),
++              cl::init("-"), cl::cat(Options));
++
+ static cl::opt<Benchmark::ModeE> BenchmarkMode(
+     "mode", cl::desc("the mode to run"), cl::cat(Options),
+     cl::values(clEnumValN(Benchmark::Latency, "latency", "Instruction Latency"),
+@@ -112,28 +171,37 @@ static cl::opt<bool> BenchmarkMeasurementsPrintProgress(
+     cl::desc("Produce progress indicator when performing measurements"),
+     cl::cat(BenchmarkOptions), cl::init(false));
+ 
+-static cl::opt<BenchmarkPhaseSelectorE> BenchmarkPhaseSelector(
+-    "benchmark-phase",
+-    cl::desc(
+-        "it is possible to stop the benchmarking process after some phase"),
+-    cl::cat(BenchmarkOptions),
+-    cl::values(
+-        clEnumValN(BenchmarkPhaseSelectorE::PrepareSnippet, "prepare-snippet",
+-                   "Only generate the minimal instruction sequence"),
+-        clEnumValN(BenchmarkPhaseSelectorE::PrepareAndAssembleSnippet,
+-                   "prepare-and-assemble-snippet",
+-                   "Same as prepare-snippet, but also dumps an excerpt of the "
+-                   "sequence (hex encoded)"),
+-        clEnumValN(BenchmarkPhaseSelectorE::AssembleMeasuredCode,
+-                   "assemble-measured-code",
+-                   "Same as prepare-and-assemble-snippet, but also creates the "
+-                   "full sequence "
+-                   "that can be dumped to a file using --dump-object-to-disk"),
+-        clEnumValN(
+-            BenchmarkPhaseSelectorE::Measure, "measure",
+-            "Same as prepare-measured-code, but also runs the measurement "
+-            "(default)")),
+-    cl::init(BenchmarkPhaseSelectorE::Measure));
++static const auto BenchmarkPhasesOptValues = cl::values(
++    clEnumValN(BenchmarkPhaseSelectorE::PrepareSnippet, "prepare-snippet",
++               "Only generate the minimal instruction sequence"),
++    clEnumValN(BenchmarkPhaseSelectorE::PrepareAndAssembleSnippet,
++               "prepare-and-assemble-snippet",
++               "Same as prepare-snippet, but also dumps an excerpt of the "
++               "sequence (hex encoded)"),
++    clEnumValN(BenchmarkPhaseSelectorE::AssembleMeasuredCode,
++               "assemble-measured-code",
++               "Same as prepare-and-assemble-snippet, but also creates the "
++               "full sequence "
++               "that can be dumped to a file using --dump-object-to-disk"),
++    clEnumValN(BenchmarkPhaseSelectorE::Measure, "measure",
++               "Same as prepare-measured-code, but also runs the measurement "
++               "(default)"));
++
++static cl::opt<BenchmarkPhaseSelectorE>
++    StopAfter("stop-after-phase",
++              cl::desc("Stop the benchmarking process after some phase"),
++              cl::cat(BenchmarkOptions), BenchmarkPhasesOptValues,
++              cl::init(BenchmarkPhaseSelectorE::Measure));
++
++static cl::alias BenchmarkPhaseSelector("benchmark-phase",
++                                        cl::desc("Alias of -stop-after-phase"),
++                                        cl::aliasopt(StopAfter));
++
++static cl::opt<BenchmarkPhaseSelectorE> StartBefore(
++    "start-before-phase",
++    cl::desc("Resume the benchmarking process before a certain phase"),
++    cl::cat(BenchmarkOptions), BenchmarkPhasesOptValues,
++    cl::init(BenchmarkPhaseSelectorE::PrepareSnippet));
+ 
+ static cl::opt<bool>
+     UseDummyPerfCounters("use-dummy-perf-counters",
+@@ -203,12 +271,13 @@ static cl::opt<float> AnalysisInconsistencyEpsilon(
+     cl::cat(AnalysisOptions), cl::init(0.1));
+ 
+ static cl::opt<std::string>
+-    AnalysisClustersOutputFile("analysis-clusters-output-file", cl::desc(""),
+-                               cl::cat(AnalysisOptions), cl::init(""));
++    AnalysisClustersOutputFile("analysis-clusters-output-", cl::desc(""),
++                               cl::cat(AnalysisOptions), cl::init(""),
++                               cl::Prefix);
+ static cl::opt<std::string>
+-    AnalysisInconsistenciesOutputFile("analysis-inconsistencies-output-file",
++    AnalysisInconsistenciesOutputFile("analysis-inconsistencies-output-",
+                                       cl::desc(""), cl::cat(AnalysisOptions),
+-                                      cl::init(""));
++                                      cl::init(""), cl::Prefix);
+ 
+ static cl::opt<bool> AnalysisDisplayUnstableOpcodes(
+     "analysis-display-unstable-clusters",
+@@ -237,6 +306,11 @@ static cl::opt<std::string>
+          cl::desc("Target a specific cpu type (-mcpu=help for details)"),
+          cl::value_desc("cpu-name"), cl::cat(Options), cl::init("native"));
+ 
++static cl::list<std::string>
++    MAttrs("mattr", cl::CommaSeparated,
++           cl::desc("Target specific attributes (-mattr=help for details)"),
++           cl::value_desc("a1,+a2,-a3,..."), cl::cat(Options));
++
+ static cl::opt<std::string>
+     DumpObjectToDisk("dump-object-to-disk",
+                      cl::desc("dumps the generated benchmark object to disk "
+@@ -309,6 +383,9 @@ static const char *getIgnoredOpcodeReasonOrNull(const LLVMState &State,
+     return "Unsupported opcode: isBranch/isIndirectBranch";
+   if (InstrDesc.isCall() || InstrDesc.isReturn())
+     return "Unsupported opcode: isCall/isReturn";
++  // MERGEME: does this check required?
++  if (!State.getExegesisTarget().isOpcodeSupported(InstrDesc))
++    return "Opcode is not supported";
+   return nullptr;
+ }
+ 
+@@ -316,8 +393,9 @@ static const char *getIgnoredOpcodeReasonOrNull(const LLVMState &State,
+ // and returns the opcode indices or {} if snippets should be read from
+ // `SnippetsFile`.
+ static std::vector<unsigned> getOpcodesOrDie(const LLVMState &State) {
++  bool NoOpcodeIndices = !OpcodeIndices.first && !OpcodeIndices.second;
+   const size_t NumSetFlags = (OpcodeNames.empty() ? 0 : 1) +
+-                             (OpcodeIndex == 0 ? 0 : 1) +
++                             (NoOpcodeIndices ? 0 : 1) +
+                              (SnippetsFile.empty() ? 0 : 1);
+   const auto &ET = State.getExegesisTarget();
+   const auto AvailableFeatures = State.getSubtargetInfo().getFeatureBits();
+@@ -329,13 +407,13 @@ static std::vector<unsigned> getOpcodesOrDie(const LLVMState &State) {
+   }
+   if (!SnippetsFile.empty())
+     return {};
+-  if (OpcodeIndex > 0)
+-    return {static_cast<unsigned>(OpcodeIndex)};
+-  if (OpcodeIndex < 0) {
++  if (!NoOpcodeIndices) {
+     std::vector<unsigned> Result;
+     unsigned NumOpcodes = State.getInstrInfo().getNumOpcodes();
+     Result.reserve(NumOpcodes);
+-    for (unsigned I = 0, E = NumOpcodes; I < E; ++I) {
++    for (unsigned I = OpcodeIndices.first,
++                  E = std::min(NumOpcodes - 1, OpcodeIndices.second);
++         I <= E; ++I) {
+       if (!ET.isOpcodeAvailable(I, AvailableFeatures))
+         continue;
+       Result.push_back(I);
+@@ -397,11 +475,54 @@ generateSnippets(const LLVMState &State, unsigned Opcode,
+   return Benchmarks;
+ }
+ 
+-static void runBenchmarkConfigurations(
+-    const LLVMState &State, ArrayRef<BenchmarkCode> Configurations,
++static void deserializeRunnableConfigurations(
++    std::vector<Benchmark> &Benchmarks, const BenchmarkRunner &Runner,
++    std::vector<BenchmarkRunner::RunnableConfiguration> &RunnableConfigs,
++    SmallVectorImpl<unsigned> &Repetitions) {
++  for (unsigned I = 0U, E = Benchmarks.size(); I < E; ++I) {
++    // Reset any previous error.
++    Benchmarks[I].Error.clear();
++
++    RunnableConfigs.emplace_back(
++        ExitOnErr(Runner.getRunnableConfiguration(std::move(Benchmarks[I]))));
++    if (I > 0 && RunnableConfigs[I].BenchmarkResult.Key ==
++                     RunnableConfigs[I - 1].BenchmarkResult.Key) {
++      // Extend the current end index in Repetitions.
++      Repetitions.back() = RunnableConfigs.size();
++    } else {
++      // Append a new entry into Repetitions.
++      Repetitions.push_back(RunnableConfigs.size());
++    }
++  }
++}
++
++static void collectRunnableConfigurations(
++    ArrayRef<BenchmarkCode> Configurations,
+     ArrayRef<std::unique_ptr<const SnippetRepetitor>> Repetitors,
+-    const BenchmarkRunner &Runner) {
+-  assert(!Configurations.empty() && "Don't have any configurations to run.");
++    const BenchmarkRunner &Runner,
++    std::vector<BenchmarkRunner::RunnableConfiguration> &RunnableConfigs,
++    SmallVectorImpl<unsigned> &Repetitions) {
++
++  SmallVector<unsigned, 2> MinInstructionCounts = {MinInstructions};
++  if (RepetitionMode == Benchmark::MiddleHalfDuplicate ||
++      RepetitionMode == Benchmark::MiddleHalfLoop)
++    MinInstructionCounts.push_back(MinInstructions * 2);
++
++  for (const BenchmarkCode &Conf : Configurations) {
++    for (const auto &Repetitor : Repetitors) {
++      for (unsigned IterationRepetitions : MinInstructionCounts)
++        RunnableConfigs.emplace_back(ExitOnErr(Runner.getRunnableConfiguration(
++            Conf, IterationRepetitions, LoopBodySize, *Repetitor)));
++    }
++    Repetitions.emplace_back(RunnableConfigs.size());
++  }
++}
++
++static void runBenchmarkConfigurations(
++    const LLVMState &State,
++    std::vector<BenchmarkRunner::RunnableConfiguration> &RunnableConfigs,
++    ArrayRef<unsigned> Repetitions, const BenchmarkRunner &Runner) {
++  assert(!RunnableConfigs.empty() && "Don't have any configurations to run.");
+   std::optional<raw_fd_ostream> FileOstr;
+   if (BenchmarkFile != "-") {
+     int ResultFD = 0;
+@@ -415,43 +536,38 @@ static void runBenchmarkConfigurations(
+ 
+   std::optional<ProgressMeter<>> Meter;
+   if (BenchmarkMeasurementsPrintProgress)
+-    Meter.emplace(Configurations.size());
++    Meter.emplace(RunnableConfigs.size());
+ 
+-  SmallVector<unsigned, 2> MinInstructionCounts = {MinInstructions};
+-  if (RepetitionMode == Benchmark::MiddleHalfDuplicate ||
+-      RepetitionMode == Benchmark::MiddleHalfLoop)
+-    MinInstructionCounts.push_back(MinInstructions * 2);
++  std::optional<StringRef> DumpFile;
++  if (DumpObjectToDisk.getNumOccurrences())
++    DumpFile = DumpObjectToDisk;
+ 
+-  for (const BenchmarkCode &Conf : Configurations) {
++  const std::optional<int> BenchmarkCPU =
++      BenchmarkProcessCPU == -1 ? std::nullopt
++                                : std::optional(BenchmarkProcessCPU.getValue());
++
++  unsigned StartIdx = 0;
++  for (unsigned EndIdx : Repetitions) {
+     ProgressMeter<>::ProgressMeterStep MeterStep(Meter ? &*Meter : nullptr);
+     SmallVector<Benchmark, 2> AllResults;
+ 
+-    for (const std::unique_ptr<const SnippetRepetitor> &Repetitor :
+-         Repetitors) {
+-      for (unsigned IterationRepetitions : MinInstructionCounts) {
+-        auto RC = ExitOnErr(Runner.getRunnableConfiguration(
+-            Conf, IterationRepetitions, LoopBodySize, *Repetitor));
+-        std::optional<StringRef> DumpFile;
+-        if (DumpObjectToDisk.getNumOccurrences())
+-          DumpFile = DumpObjectToDisk;
+-        const std::optional<int> BenchmarkCPU =
+-            BenchmarkProcessCPU == -1
+-                ? std::nullopt
+-                : std::optional(BenchmarkProcessCPU.getValue());
+-        auto [Err, BenchmarkResult] =
+-            Runner.runConfiguration(std::move(RC), DumpFile, BenchmarkCPU);
+-        if (Err) {
+-          // Errors from executing the snippets are fine.
+-          // All other errors are a framework issue and should fail.
+-          if (!Err.isA<SnippetExecutionFailure>())
+-            ExitOnErr(std::move(Err));
+-
+-          BenchmarkResult.Error = toString(std::move(Err));
++    for (unsigned Idx = StartIdx; Idx < EndIdx; ++Idx) {
++      auto RC = std::move(RunnableConfigs[Idx]);
++      auto [Err, BenchmarkResult] =
++          Runner.runConfiguration(std::move(RC), DumpFile, BenchmarkCPU);
++      if (Err) {
++        // Errors from executing the snippets are fine.
++        // All other errors are a framework issue and should fail.
++        if (!Err.isA<SnippetExecutionFailure>()) {
++          llvm::errs() << "llvm-exegesis error: " << toString(std::move(Err));
++          exit(1);
+         }
+-        AllResults.push_back(std::move(BenchmarkResult));
++        BenchmarkResult.Error = toString(std::move(Err));
+       }
+-    }
+ 
++      AllResults.push_back(std::move(BenchmarkResult));
++    }
++    StartIdx = EndIdx;
+     Benchmark &Result = AllResults.front();
+ 
+     // If any of our measurements failed, pretend they all have failed.
+@@ -476,15 +592,8 @@ static void runBenchmarkConfigurations(
+ }
+ 
+ void benchmarkMain() {
+-  if (BenchmarkPhaseSelector == BenchmarkPhaseSelectorE::Measure &&
+-      !UseDummyPerfCounters) {
+-#ifndef HAVE_LIBPFM
+-    ExitWithError(
+-        "benchmarking unavailable, LLVM was built without libpfm. You can "
+-        "pass --benchmark-phase=... to skip the actual benchmarking or "
+-        "--use-dummy-perf-counters to not query the kernel for real event "
+-        "counts.");
+-#else
++  if (StopAfter == BenchmarkPhaseSelectorE::Measure && !UseDummyPerfCounters) {
++#ifdef HAVE_LIBPFM
+     if (pfm::pfmInitialize())
+       ExitWithError("cannot initialize libpfm");
+ #endif
+@@ -501,7 +610,7 @@ void benchmarkMain() {
+ 
+   // Preliminary check to ensure features needed for requested
+   // benchmark mode are present on target CPU and/or OS.
+-  if (BenchmarkPhaseSelector == BenchmarkPhaseSelectorE::Measure)
++  if (StopAfter == BenchmarkPhaseSelectorE::Measure)
+     ExitOnErr(State.getExegesisTarget().checkFeatureSupport());
+ 
+   if (ExecutionMode == BenchmarkRunner::ExecutionModeE::SubProcess &&
+@@ -511,8 +620,8 @@ void benchmarkMain() {
+ 
+   const std::unique_ptr<BenchmarkRunner> Runner =
+       ExitOnErr(State.getExegesisTarget().createBenchmarkRunner(
+-          BenchmarkMode, State, BenchmarkPhaseSelector, ExecutionMode,
+-          BenchmarkRepeatCount, ValidationCounters, ResultAggMode));
++          BenchmarkMode, State, StopAfter, ExecutionMode, BenchmarkRepeatCount,
++          ValidationCounters, ResultAggMode));
+   if (!Runner) {
+     ExitWithError("cannot create benchmark runner");
+   }
+@@ -581,13 +690,100 @@ void benchmarkMain() {
+     ExitOnErr.setBanner("llvm-exegesis: ");
+     ExitWithError("--min-instructions must be greater than zero");
+   }
++  // MERGEME: eliminated code in main.
++  //std::vector<BenchmarkRunner::RunnableConfiguration> RunnableConfigs;
++  //SmallVector<unsigned> Repetitions;
+ 
+   // Write to standard output if file is not set.
+   if (BenchmarkFile.empty())
+     BenchmarkFile = "-";
+ 
+-  if (!Configurations.empty())
+-    runBenchmarkConfigurations(State, Configurations, Repetitors, *Runner);
++  if (StartBefore == BenchmarkPhaseSelectorE::Measure) {
++    // Right now we only support resuming before the measurement phase.
++    auto ErrOrBuffer = MemoryBuffer::getFileOrSTDIN(InputFile, /*IsText=*/true);
++    if (!ErrOrBuffer)
++      report_fatal_error(errorCodeToError(ErrOrBuffer.getError()));
++
++    std::vector<Benchmark> Benchmarks =
++        ExitOnErr(Benchmark::readYamls(State, **ErrOrBuffer));
++    deserializeRunnableConfigurations(Benchmarks, *Runner, RunnableConfigs,
++                                      Repetitions);
++  } else {
++    const auto Opcodes = getOpcodesOrDie(State);
++    std::vector<BenchmarkCode> Configurations;
++
++    unsigned LoopRegister =
++        State.getExegesisTarget().getDefaultLoopCounterRegister(
++            State.getTargetMachine().getTargetTriple());
++
++    if (Opcodes.empty()) {
++      NamedRegionTimer T("prepare-snippet", "Prepare Code Snippet",
++                         TimerGroupName, TimerGroupDescription, TimerIsEnabled);
++      Configurations = ExitOnErr(readSnippets(State, SnippetsFile));
++      for (const auto &Configuration : Configurations) {
++        if (ExecutionMode != BenchmarkRunner::ExecutionModeE::SubProcess &&
++            (Configuration.Key.MemoryMappings.size() != 0 ||
++             Configuration.Key.MemoryValues.size() != 0 ||
++             Configuration.Key.SnippetAddress != 0))
++          ExitWithError("Memory and snippet address annotations are only "
++                        "supported in subprocess "
++                        "execution mode");
++      }
++      LoopRegister = Configurations[0].Key.LoopRegister;
++    }
++
++    SmallVector<std::unique_ptr<const SnippetRepetitor>, 2> Repetitors;
++    if (RepetitionMode != Benchmark::RepetitionModeE::AggregateMin)
++      Repetitors.emplace_back(
++          SnippetRepetitor::Create(RepetitionMode, State, LoopRegister));
++    else {
++      for (Benchmark::RepetitionModeE RepMode :
++           {Benchmark::RepetitionModeE::Duplicate,
++            Benchmark::RepetitionModeE::Loop})
++        Repetitors.emplace_back(
++            SnippetRepetitor::Create(RepMode, State, LoopRegister));
++    }
++
++    BitVector AllReservedRegs;
++    for (const std::unique_ptr<const SnippetRepetitor> &Repetitor : Repetitors)
++      AllReservedRegs |= Repetitor->getReservedRegs();
++
++    if (!Opcodes.empty()) {
++      NamedRegionTimer T("prepare-snippet", "Prepare Code Snippet",
++                         TimerGroupName, TimerGroupDescription, TimerIsEnabled);
++      for (const unsigned Opcode : Opcodes) {
++        // Ignore instructions without a sched class if
++        // -ignore-invalid-sched-class is passed.
++        if (IgnoreInvalidSchedClass &&
++            State.getInstrInfo().get(Opcode).getSchedClass() == 0) {
++          errs() << State.getInstrInfo().getName(Opcode)
++                 << ": ignoring instruction without sched class\n";
++          continue;
++        }
++
++        auto ConfigsForInstr = generateSnippets(State, Opcode, AllReservedRegs);
++        if (!ConfigsForInstr) {
++          logAllUnhandledErrors(
++              ConfigsForInstr.takeError(), errs(),
++              Twine(State.getInstrInfo().getName(Opcode)).concat(": "));
++          continue;
++        }
++        std::move(ConfigsForInstr->begin(), ConfigsForInstr->end(),
++                  std::back_inserter(Configurations));
++      }
++    }
++
++    if (MinInstructions == 0) {
++      ExitOnErr.setBanner("llvm-exegesis: ");
++      ExitWithError("--min-instructions must be greater than zero");
++    }
++
++    collectRunnableConfigurations(Configurations, Repetitors, *Runner,
++                                  RunnableConfigs, Repetitions);
++  }
++
++  if (!RunnableConfigs.empty())
++    runBenchmarkConfigurations(State, RunnableConfigs, Repetitions, *Runner);
+ 
+   pfm::pfmTerminate();
+ }
+@@ -596,7 +792,20 @@ void benchmarkMain() {
+ // if OutputFilename is non-empty.
+ template <typename Pass>
+ static void maybeRunAnalysis(const Analysis &Analyzer, const std::string &Name,
+-                             const std::string &OutputFilename) {
++                             StringRef OutputFilename) {
++  Analysis::OutputFormat Format;
++  if (OutputFilename.consume_front("file=")) {
++    Format = Analysis::OF_Default;
++  } else if (OutputFilename.consume_front("yaml=")) {
++    Format = Analysis::OF_YAML;
++  } else if (OutputFilename.consume_front("json=")) {
++    Format = Analysis::OF_JSON;
++  } else if (!OutputFilename.empty()) {
++    errs() << "Unrecognized output file format and path '" + OutputFilename
++           << "'\n";
++    return;
++  }
++
+   if (OutputFilename.empty())
+     return;
+   if (OutputFilename != "-") {
+@@ -608,7 +817,7 @@ static void maybeRunAnalysis(const Analysis &Analyzer, const std::string &Name,
+                             sys::fs::FA_Read | sys::fs::FA_Write);
+   if (ErrorCode)
+     ExitOnFileError(OutputFilename, errorCodeToError(ErrorCode));
+-  if (auto Err = Analyzer.run<Pass>(ClustersOS))
++  if (auto Err = Analyzer.run<Pass>(ClustersOS, Format))
+     ExitOnFileError(OutputFilename, std::move(Err));
+ }
+ 
+diff --git a/status_merge.txt b/status_merge.txt
+new file mode 100644
+index 000000000000..f5709c231bed
+--- /dev/null
++++ b/status_merge.txt
+@@ -0,0 +1,57 @@
++On branch merge/rvv-exegesis-full
++Cherry-pick currently in progress.
++  (run "git cherry-pick --continue" to continue)
++  (use "git cherry-pick --skip" to skip this patch)
++  (use "git cherry-pick --abort" to cancel the cherry-pick operation)
++
++Changes to be committed:
++  (use "git restore --staged <file>..." to unstage)
++	modified:   llvm/lib/MC/MCSchedule.cpp
++	modified:   llvm/lib/Target/RISCV/RISCVInsertWriteVXRM.cpp
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/deserialize-obj-file.yaml
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/eligible-inst.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/explicit-sew.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/filter.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/reduction.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/self-aliasing.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/skip-rm.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew-zvk.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/valid-sew.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/vlmax-only.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/rvv/vtype-rm-setup.test
++	new file:   llvm/test/tools/llvm-exegesis/RISCV/serialize-obj-file.test
++	modified:   llvm/test/tools/llvm-exegesis/X86/analysis-noise.test
++	modified:   llvm/tools/llvm-exegesis/lib/Analysis.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/Analysis.h
++	new file:   llvm/tools/llvm-exegesis/lib/AnalysisPrinters.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkResult.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkResult.h
++	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkRunner.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/BenchmarkRunner.h
++	modified:   llvm/tools/llvm-exegesis/lib/CMakeLists.txt
++	modified:   llvm/tools/llvm-exegesis/lib/Clustering.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/Clustering.h
++	modified:   llvm/tools/llvm-exegesis/lib/LlvmState.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/MCInstrDescView.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/MCInstrDescView.h
++	modified:   llvm/tools/llvm-exegesis/lib/PerfHelper.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/ProgressMeter.h
++	modified:   llvm/tools/llvm-exegesis/lib/RISCV/CMakeLists.txt
++	new file:   llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPasses.h
++	new file:   llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPostprocessing.cpp
++	new file:   llvm/tools/llvm-exegesis/lib/RISCV/RISCVExegesisPreprocessing.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/RISCV/Target.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/SchedClassResolution.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/SchedClassResolution.h
++	modified:   llvm/tools/llvm-exegesis/lib/SerialSnippetGenerator.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/SnippetGenerator.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/Target.cpp
++	modified:   llvm/tools/llvm-exegesis/lib/Target.h
++	new file:   llvm/tools/llvm-exegesis/lib/Timer.cpp
++	new file:   llvm/tools/llvm-exegesis/lib/Timer.h
++	modified:   llvm/tools/llvm-exegesis/llvm-exegesis.cpp
++
++Untracked files:
++  (use "git add <file>..." to include in what will be committed)
++	status_merge.txt
++

@@ -8,12 +8,18 @@ set(LLVM_LINK_COMPONENTS
   RISCV
   Exegesis
   Core
+  # MERGEME: is CodeGenTypes required?
+  CodeGenTypes
+  # MERGEME: is MC required?
+  MC
   Support
   )
 
 add_llvm_library(LLVMExegesisRISCV
   DISABLE_LLVM_LINK_LLVM_DYLIB
   STATIC
+  RISCVExegesisPostprocessing.cpp
+  RISCVExegesisPreprocessing.cpp
   Target.cpp
 
   DEPENDS
